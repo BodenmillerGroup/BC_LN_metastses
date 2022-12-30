@@ -1,0 +1,1686 @@
+---
+title: "Analysis_pipeline4"
+author: "Jana"
+date: "2/27/2020"
+output: html_document
+---
+
+IHC validation of IMC findings in sequential LN met sections of the same cohort. IHC quantification was performed using QuPATH.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+library(data.table)
+library(SingleCellExperiment)
+library(ggplot2)
+library(stringr)
+library(broom)
+library(survival)
+```
+
+Function to map core names between IHC and IMC (different naming conventions used)
+```{r map function}
+map_cores = function(IHC_cells){
+  
+  #Extract column and row number
+  IHC_cells[,row := as.numeric(sub("\\-.*", "", `TMA core`))]
+  IHC_cells[,col := as.numeric(sub(".*\\-", "", `TMA core`))]
+
+  #In case control cores detected, number of columns is not divisible by 8 (control cores would shift col numbering)
+  if (max(IHC_cells$col)%%8 != 0){
+    
+    #In case control cores were measured -> exclude first col
+    IHC_cells = IHC_cells[col != 1,]
+    
+    #Substract one to start counting at 1 with the real columns
+    IHC_cells$col = IHC_cells$col -1
+  }
+  
+  #Translate naming to blocks (because IMC naming is per block and IHC naming just numbered through the entire TMA)
+  IHC_cells[col <= 8, block := "A" ]
+  IHC_cells[col <= 8, col_block := col]
+  IHC_cells[col > 8 & col <= 16, block := "B"]
+  IHC_cells[col > 8 & col <= 16, col_block := col - 8]
+  IHC_cells[col > 16 & col <= 24, block := "C"]
+  IHC_cells[col > 16 & col <= 24, col_block := col - 16]
+  IHC_cells[,matched_core := paste0(block,"X",col_block,"Y",row)]
+
+  return(IHC_cells)
+}
+
+```
+
+IMC - IHC comparison (read in IMC tumor cell data)
+```{r read IMC}
+#Read in tumor sce with PG info from above already included
+sce_t = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_T.rds')
+
+#Metastasis
+met_counts = as.data.frame(t(counts(subset(sce_t,,TissueType == "lymph node mts"))))
+met_counts$Metadata_Description = colData(subset(sce_t,,TissueType == "lymph node mts"))[,"Metadata_Description"]
+
+# #Primary
+# prim_counts = as.data.frame(t(counts(subset(sce_t,,TissueType == "primary tumor"))))
+# prim_counts$Metadata_Description = colData(subset(sce_t,,TissueType == "primary tumor"))[,"Metadata_Description"]
+
+```
+
+Read in IHC single-cell quantification data of p53
+```{r read IHC p53}
+#ZTMA25, need only LN mets
+IHC_p53 = fread('/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/IHC/QuPATH_project_ZTMA25_p53/measurements_ZT25_27_cells.csv',header = T)
+
+#Map core names
+IHC_p53 = map_cores(IHC_p53)
+IHC_p53$matched_core = paste0("ZTMA25_",IHC_p53$matched_core)
+
+# #ZTMA26, don't need primaries
+# IHC_26 = fread('/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/IHC/QuPATH_project_ZTMA26_p53/measurements_cells.csv',header = T)
+# 
+# #Map core names
+# IHC_26 = map_cores(IHC_26)
+# IHC_26$matched_core = paste0("ZTMA26_",IHC_26$matched_core)
+# 
+# #Combine
+# IHC_p53 = rbind(IHC_p53,IHC_26)
+
+#Look at data distribution
+ggplot(IHC_p53, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+
+#Log transform (there are few negative values -> add max negative value), use log1p because I don't want neg values after log
+IHC_p53[, log_DAB := log1p(`Nucleus: DAB OD mean` + abs(min(`Nucleus: DAB OD mean`)))]
+ggplot(IHC_p53, aes(x = log_DAB)) + geom_density()
+
+#Arcsinh transform
+IHC_p53[, asinh_DAB := asinh(`Nucleus: DAB OD mean`)]
+ggplot(IHC_p53, aes(x = asinh_DAB)) + geom_density()
+
+#Normalize untransformed DAB between 0 and 1
+IHC_p53[,`Nucleus: DAB OD mean`:= `Nucleus: DAB OD mean`/max(`Nucleus: DAB OD mean`)]
+IHC_p53$`Nucleus: DAB OD mean`[IHC_p53$`Nucleus: DAB OD mean`<0] = 0
+
+
+#Calc fractions based on QuPATH quantification of positive cells
+IHC_p53[,ncells := .N,by = "Name"]
+frac_p53 = unique(IHC_p53[,c("Image","Name","matched_core","TMA core","ncells")])
+frac_p53[,Class := sub(".*\\ - ", "", Name)]
+frac_p53 = dcast.data.table(frac_p53,"Image + `TMA core` + matched_core ~ Class",value.var = "ncells",fill = 0)
+frac_p53[,frac_pos := `Tumor: Positive`/(`Tumor: Positive` + `Tumor: Negative`)]
+
+#Calc mean tumor cell expression levels
+mean_p53 = IHC_p53[str_detect(Name, "Tumor"),]
+mean_p53[,mean_expr := mean(`Nucleus: DAB OD mean`),by = "TMA core"]
+mean_p53 = unique(mean_p53[,c("Image","TMA core","matched_core","mean_expr")])
+
+#Add patient info to IHC data
+add = unique(as.data.table(colData(sce_t)[,c("PID","Metadata_Description","core")]))
+add[,matched_core := paste(strsplit(Metadata_Description,"_")[[1]][c(1,4)],collapse = "_"),by = "Metadata_Description"]
+mean_p53 = merge(mean_p53,add,by = "matched_core")
+frac_p53 = merge(frac_p53,add,by = "matched_core")
+
+```
+
+Mean expression correlation between IMC and IHC for p53
+```{r correlation IHC IMC}
+#Calc IMC means met
+mean_met_IMC = as.data.table(met_counts[,c("Tb159_p53","Metadata_Description")])
+mean_met_IMC[,mean_p53_IMC := mean(Tb159_p53),by = "Metadata_Description"]
+mean_met_IMC = unique(mean_met_IMC[,c("Metadata_Description","mean_p53_IMC")])
+
+# #Calc IMC means primary
+# mean_prim_IMC = as.data.table(prim_counts[,c("Tb159_p53","Metadata_Description")])
+# mean_prim_IMC[,mean_p53_IMC := mean(Tb159_p53),by = "Metadata_Description"]
+# mean_prim_IMC = unique(mean_prim_IMC[,c("Metadata_Description","mean_p53_IMC")])
+
+#Combine with IHC data
+comb_mean = merge(mean_p53,mean_met_IMC,by = "Metadata_Description")
+
+#Correlate
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/corr_p53.pdf")
+ggplot(comb_mean, aes(x = mean_expr, y = mean_p53_IMC))+ geom_point()+geom_smooth(method = "lm")
+dev.off()
+cor(comb_mean$mean_expr,comb_mean$mean_p53_IMC)
+```
+
+Find thresholds for patent
+```{r thersholds}
+#Check survival association with upper 75%ile
+comb_mean$upper = 0
+# comb_mean[mean_expr >= quantile(mean_expr,0.25),upper := 1]
+#comb_mean[mean_expr >= quantile(mean_expr,0.5),upper := 1]
+comb_mean[mean_expr >= quantile(mean_expr,0.75),upper := 1]
+
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+surv_dat = merge(comb_mean,surv_dat,by = c("PID"))
+
+#Mean expression of IHC is also associated better survival
+res.cox2 <- coxph(Surv(OS, censoring) ~ upper, data =  surv_dat)#mean_p53_IMC
+summary(res.cox2)
+
+#For min fold changes
+onlyupper = comb_mean[upper == 1,]
+onlyupper[mean_expr == min(mean_expr),]#min expression of good survival ones
+
+comb_mean[mean_expr == min(mean_expr),]#min expression overall
+comb_mean[order(mean_expr)]
+
+
+#Calc curves
+SurvObj <- Surv(surv_dat$OS, surv_dat$censoring)
+km.as.groups <- survfit(SurvObj ~ surv_dat$upper)
+km.as.one <- survfit(SurvObj ~ 1)
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/p53_upper.pdf")
+ggplot(tidy(km.as.groups), aes(time, estimate, group = strata)) +
+    geom_line(aes(color = strata)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .25)+
+  ylim(0,1)
+dev.off()
+
+```
+
+Survival association of continuous average tumor cell expression of p53 in LN mets
+```{r survival average expression}
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+#Combine
+comb_mean_p53 = comb_mean[,-c("Metadata_Description","matched_core","TMA core")]
+comb_mean_p53[,mean_expr := mean(mean_expr),by = c("PID","Image")] #IMC
+comb_mean_p53[,mean_p53_IMC := mean(mean_p53_IMC),by = c("PID","Image")] #IHC
+comb_mean_p53 = unique(comb_mean_p53)
+surv_dat = merge(comb_mean_p53,surv_dat,by = c("PID"))
+
+#Mean expression of IHC
+res.cox2 <- coxph(Surv(OS, censoring) ~ mean_expr, data =  surv_dat)#mean_p53_IMC
+summary(res.cox2)
+
+#Mean expression of IMC
+res.cox2 <- coxph(Surv(OS, censoring) ~ mean_p53_IMC, data =  surv_dat)#mean_p53_IMC
+summary(res.cox2)
+
+```
+
+Survival association with fraction of positive/highly expressing cells for p53 in LN mets
+```{r survival fractions high}
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+#Only in LNs
+LN_cores = unique(subset(sce_t,,TissueType == "lymph node mts")$Metadata_Description)
+
+#Combine for fraction of positive cells
+frac_p53 = frac_p53[Metadata_Description %in% LN_cores,]
+frac_p53 = frac_p53[,c("frac_pos","PID")]
+frac_p53[,frac_pos := mean(frac_pos),by = c("PID")]
+frac_p53 = unique(frac_p53)
+surv_dat = merge(frac_p53,surv_dat,by = c("PID"))
+
+#Is not associated with survival but makes sense since we can't distinguish CT29 based on IHC (has to be high for p53 and low for everything else) -> p53 high is what matters, not p53 positive
+res.cox2 <- coxph(Surv(OS, censoring) ~ frac_pos, data =  surv_dat)
+summary(res.cox2)
+
+#Define highly expressing cells
+ggplot(IHC_p53, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+ggplot(IHC_p53, aes(x = log_DAB)) + geom_density()
+
+
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+#Define highly expressing cells
+IHC_p53$high = 0
+IHC_p53$high[IHC_p53$`Nucleus: DAB OD mean` > 0.2] = 1 #Anythin between 0.2 and 0.4 works
+IHC_p53[,nr_high := sum(high),by = "TMA core"]
+
+#Calculate fractions
+frac_high = unique(IHC_p53[,c("Image","Name","matched_core","TMA core","ncells","nr_high")])
+frac_high[,Class := sub(".*\\ - ", "", Name)]
+frac_high = dcast.data.table(frac_high,"Image + `TMA core` + matched_core + nr_high ~ Class",value.var = "ncells",fill = 0)
+frac_high = frac_high[,-c("Stroma: Negative","Stroma: Positive")]
+frac_high[,frac_high := nr_high/(`Tumor: Positive` + `Tumor: Negative`)]
+frac_high[is.na(frac_high),frac_high := 0]
+frac_high = merge(frac_high,add,by = "matched_core")
+
+#Combine
+frac_high = frac_high[Metadata_Description %in% LN_cores,]
+frac_high = frac_high[,c("nr_high","PID","frac_high")]
+frac_high[,nr_high := mean(nr_high),by = c("PID")]
+frac_high[,frac_high := mean(frac_high),by = c("PID")]
+frac_high_p53 = unique(frac_high)
+surv_dat = merge(frac_high_p53,surv_dat,by = c("PID"))
+
+#Fraction of p53 high cells is strongly associated with worse survival
+res.cox2 <- coxph(Surv(OS, censoring) ~ frac_high, data =  surv_dat)
+summary(res.cox2)
+
+```
+
+Thresholds for patent
+```{r thesholds}
+#Check upper 75%ile
+surv_dat$upper = 0
+#surv_dat[frac_high >= quantile(frac_high,0.5),upper := 1]
+surv_dat[frac_high >= quantile(frac_high,0.8),upper := 1]
+
+#Mean expression of IHC is also associated better survival
+res.cox2 <- coxph(Surv(OS, censoring) ~ upper, data =  surv_dat)#mean_p53_IMC
+summary(res.cox2)
+
+onlyupper = surv_dat[upper == 1,]
+onlyupper[frac_high == min(frac_high),]#at least fraction for bad prognosis
+
+#Calc curves
+SurvObj <- Surv(surv_dat$OS, surv_dat$censoring)
+km.as.groups <- survfit(SurvObj ~ surv_dat$upper)
+km.as.one <- survfit(SurvObj ~ 1)
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/p53_upper.pdf")
+ggplot(tidy(km.as.groups), aes(time, estimate, group = strata)) +
+    geom_line(aes(color = strata)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .25)+
+  ylim(0,1)
+dev.off()
+
+```
+
+Walk through example patent
+```{r talk through}
+#If there are many highly expressing cells
+d = IHC_p53[nr_high == max(nr_high),]
+
+#Fewest
+d = IHC_p53[nr_high == min(nr_high),]
+
+ggplot(d, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+ggplot(d, aes(x = log_DAB)) + geom_density()
+
+#ZTMA25 
+IHC_p53_orig = fread('/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/IHC/QuPATH_project_ZTMA25_p53/measurements_ZT25_27_cells.csv',header = T)
+
+#Map core names
+IHC_p53_orig = map_cores(IHC_p53_orig)
+IHC_p53$matched_core = paste0("ZTMA25_",IHC_p53_orig$matched_core)
+
+#Low
+d = IHC_p53_orig[`TMA core` == "15-17",]
+ggplot(d, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+max(d$`Nucleus: DAB OD mean`) #x10 of control is high?
+mean(d$`Nucleus: DAB OD mean`)
+median(d$`Nucleus: DAB OD mean`)
+min(d$`Nucleus: DAB OD mean`)
+
+#High
+d = IHC_p53_orig[`TMA core` == "4-5",]
+ggplot(d, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+max(d$`Nucleus: DAB OD mean`) #x10 of control is high?
+mean(d$`Nucleus: DAB OD mean`)
+median(d$`Nucleus: DAB OD mean`)
+min(d$`Nucleus: DAB OD mean`)
+
+```
+
+Read in IHC single-cell quantification data for GATA3
+```{r IHC GATA3}
+#ZTMA25 
+IHC_GATA3 = fread('/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/IHC/QuPATH_project_ZTMA25_GATA3/measurements_ZT25_28_cells.csv',header = T)
+
+#Map core names
+IHC_GATA3 = map_cores(IHC_GATA3)
+IHC_GATA3$matched_core = paste0("ZTMA25_",IHC_GATA3$matched_core)
+
+#Log transform (there are few negative values -> add), use log1p because I don't want neg values after log
+IHC_GATA3[, log_DAB := log1p(`Nucleus: DAB OD mean` + abs(min(`Nucleus: DAB OD mean`)))]
+
+#Normalize DAB between 0 and 1
+IHC_GATA3[,`Nucleus: DAB OD mean`:= `Nucleus: DAB OD mean`/max(`Nucleus: DAB OD mean`)]
+IHC_GATA3$`Nucleus: DAB OD mean`[IHC_GATA3$`Nucleus: DAB OD mean`<0] = 0
+
+#Calc fractions based on QuPATH quant
+IHC_GATA3[,ncells := .N,by = "Name"]
+frac_GATA3 = unique(IHC_GATA3[,c("Image","Name","matched_core","TMA core","ncells")])
+frac_GATA3[,Class := sub(".*\\ - ", "", Name)]
+frac_GATA3 = dcast.data.table(frac_GATA3,"Image + `TMA core` + matched_core ~ Class",value.var = "ncells",fill = 0)
+frac_GATA3[,frac_pos := `Tumor: Positive`/(`Tumor: Positive` + `Tumor: Negative`)]
+
+#Calc mean tumor cell expression values
+mean_GATA3 = IHC_GATA3[str_detect(Name, "Tumor"),]
+mean_GATA3[,mean_expr := mean(`Nucleus: DAB OD mean`),by = "TMA core"]
+mean_GATA3 = unique(mean_GATA3[,c("Image","TMA core","matched_core","mean_expr")])
+
+#Add patient data to IHC
+add = unique(as.data.table(colData(sce_t)[,c("PID","Metadata_Description","core")]))
+add[,matched_core := paste(strsplit(Metadata_Description,"_")[[1]][c(1,4)],collapse = "_"),by = "Metadata_Description"]
+mean_GATA3 = merge(mean_GATA3,add,by = "matched_core")
+frac_GATA3 = merge(frac_GATA3,add,by = "matched_core")
+
+```
+
+Mean expression correlation between IMC and IHC for GATA3
+```{r IHC IMC correlation}
+#Calc IMC means met
+mean_met_IMC = as.data.table(met_counts[,c("Dy163_GATA3","Metadata_Description")])
+mean_met_IMC[,mean_GATA3_IMC := mean(Dy163_GATA3),by = "Metadata_Description"]
+mean_met_IMC = unique(mean_met_IMC[,c("Metadata_Description","mean_GATA3_IMC")])
+
+# #Calc IMC means primary
+# mean_prim_IMC = as.data.table(prim_counts[,c("Dy163_GATA3","Metadata_Description")])
+# mean_prim_IMC[,mean_GATA3_IMC := mean(Dy163_GATA3),by = "Metadata_Description"]
+# mean_prim_IMC = unique(mean_prim_IMC[,c("Metadata_Description","mean_GATA3_IMC")])
+
+#Combine
+comb_mean = merge(mean_GATA3,mean_met_IMC,by = "Metadata_Description")
+
+#Correlate
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/corr_GATA3.pdf")
+ggplot(comb_mean, aes(x = mean_expr, y = mean_GATA3_IMC))+ geom_point()+geom_smooth(method = "lm")
+dev.off()
+cor(comb_mean$mean_expr,comb_mean$mean_GATA3_IMC)
+```
+
+Thresholds for patent
+```{r thresholds}
+#Check upper 75%ile
+comb_mean$upper = 0
+comb_mean[mean_expr >= quantile(mean_expr,0.5),upper := 1]
+comb_mean[mean_expr >= quantile(mean_expr,0.75),upper := 1]
+
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+surv_dat = merge(comb_mean,surv_dat,by = c("PID"))
+
+#Survival association of categories
+res.cox2 <- coxph(Surv(OS, censoring) ~ upper, data =  surv_dat)#mean_p53_IMC
+summary(res.cox2)
+
+#Fold changes
+onlyupper = comb_mean[upper == 1,]
+onlyupper[mean_expr == min(mean_expr),]#min expression of good survival ones
+
+comb_mean[mean_expr == min(mean_expr),]#min expression overall
+comb_mean[order(mean_expr)]
+
+#Calc curves
+SurvObj <- Surv(surv_dat$OS, surv_dat$censoring)
+km.as.groups <- survfit(SurvObj ~ surv_dat$upper)
+km.as.one <- survfit(SurvObj ~ 1)
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/GATA3_upper.pdf")
+ggplot(tidy(km.as.groups), aes(time, estimate, group = strata)) +
+    geom_line(aes(color = strata)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .25)+
+  ylim(0,1)
+dev.off()
+
+```
+
+Survival association of continuous average tumor cell expression of GATA3 in LN mets
+```{r survival average expression}
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+#Combine
+comb_mean_GATA3 = comb_mean[,-c("Metadata_Description","matched_core","TMA core")]
+comb_mean_GATA3[,mean_expr := mean(mean_expr),by = c("PID","Image")]
+comb_mean_GATA3[,mean_GATA3_IMC := mean(mean_GATA3_IMC),by = c("PID","Image")]
+comb_mean_GATA3 = unique(comb_mean_GATA3)
+surv_dat = merge(comb_mean_GATA3,surv_dat,by = c("PID"))
+
+#Mean expression of IHC is also associated better survival
+res.cox2 <- coxph(Surv(OS, censoring) ~ mean_expr, data =  surv_dat)#mean_p53_IMC
+summary(res.cox2)
+
+```
+
+Survival association with fraction of highly expressing cells for GATA3 in LN mets
+```{r survival fractions high}
+#Define highly expressing cells
+ggplot(IHC_GATA3, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+ggplot(IHC_GATA3, aes(x = log_DAB)) + geom_density()
+
+max(IHC_GATA3$`Nucleus: DAB OD mean`)
+min(IHC_GATA3$`Nucleus: DAB OD mean`)
+
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+IHC_GATA3$high = 0
+IHC_GATA3$high[IHC_GATA3$`Nucleus: DAB OD mean` > 0.3] = 1 #Anything between 0.2 and 0.4 works
+IHC_GATA3[,nr_high := sum(high),by = "TMA core"]
+
+frac_high = unique(IHC_GATA3[,c("Image","Name","matched_core","TMA core","ncells","nr_high")])
+frac_high[,Class := sub(".*\\ - ", "", Name)]
+frac_high = dcast.data.table(frac_high,"Image + `TMA core` + matched_core + nr_high ~ Class",value.var = "ncells",fill = 0)
+frac_high = frac_high[,-c("Stroma: Negative","Stroma: Positive")]
+frac_high[,frac_high := nr_high/(`Tumor: Positive` + `Tumor: Negative`)]
+frac_high[is.na(frac_high),frac_high := 0]
+frac_high = merge(frac_high,add,by = "matched_core")
+
+#Combine
+frac_high = frac_high[Metadata_Description %in% LN_cores,]
+frac_high = frac_high[,c("nr_high","PID","frac_high")]
+frac_high[,nr_high := mean(nr_high),by = c("PID")]
+frac_high[,frac_high := mean(frac_high),by = c("PID")]
+frac_high_GATA3 = unique(frac_high)
+surv_dat = merge(frac_high_GATA3,surv_dat,by = c("PID"))
+
+#Fraction of p53 high cells is strongly associated with worse survival
+res.cox2 <- coxph(Surv(OS, censoring) ~ frac_high, data =  surv_dat)
+summary(res.cox2)
+
+```
+
+Thresholds for patent
+```{r thresholds}
+#Check upper 75%ile
+surv_dat$upper = 0
+surv_dat[frac_high >= quantile(frac_high,0.67),upper := 1]
+surv_dat[frac_high >= quantile(frac_high,0.75),upper := 2]
+
+#Mean expression of IHC is also associated better survival
+res.cox2 <- coxph(Surv(OS, censoring) ~ upper, data =  surv_dat)#mean_p53_IMC
+summary(res.cox2)
+
+onlyupper = surv_dat[upper == 1,]
+onlyupper[frac_high == min(frac_high),]#at least fraction for good prognosis
+
+#Calc curves
+SurvObj <- Surv(surv_dat$OS, surv_dat$censoring)
+km.as.groups <- survfit(SurvObj ~ surv_dat$upper)
+km.as.one <- survfit(SurvObj ~ 1)
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/GATA3_upper_30perc.pdf")
+ggplot(tidy(km.as.groups), aes(time, estimate, group = strata)) +
+    geom_line(aes(color = strata)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .25)+
+  ylim(0,1)
+dev.off()
+
+```
+
+Walk through example patent
+```{r walk through}
+#If there are many highly expressing cells
+d = IHC_GATA3[nr_high == max(nr_high),]
+
+ggplot(d, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+ggplot(d, aes(x = log_DAB)) + geom_density()
+
+#Many positive but not high
+d = IHC_GATA3[`TMA core` == "5-5",]
+
+#Negative
+d = IHC_GATA3[`TMA core` == "4-5",]
+
+#Negative
+d = IHC_GATA3[`TMA core` == "6-1",]
+
+#ZTMA25 
+IHC_GATA3_orig = fread('/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/IHC/QuPATH_project_ZTMA25_GATA3/measurements_ZT25_28_cells.csv',header = T)
+
+#Map core names
+IHC_GATA3_orig = map_cores(IHC_GATA3_orig)
+IHC_GATA3_orig$matched_core = paste0("ZTMA25_",IHC_GATA3_orig$matched_core)
+
+#Negative
+d = IHC_GATA3_orig[`TMA core` == "6-1",]
+ggplot(d, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+max(d$`Nucleus: DAB OD mean`) #0.157
+
+d = IHC_GATA3_orig[`TMA core` == "5-5",]
+ggplot(d, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+max(d$`Nucleus: DAB OD mean`) #x10 of control is high?
+
+#High
+d = IHC_GATA3_orig[`TMA core` == "13-9",]
+ggplot(d, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+max(d$`Nucleus: DAB OD mean`) #x10 of control is high?
+mean(d$`Nucleus: DAB OD mean`)
+median(d$`Nucleus: DAB OD mean`)
+min(d$`Nucleus: DAB OD mean`)
+
+###Log
+
+#Negative
+d = IHC_GATA3[`TMA core` == "6-1",]
+ggplot(d, aes(x = log_DAB)) + geom_density()
+max(d$log_DAB) #0.29
+
+d = IHC_GATA3[`TMA core` == "5-5",]
+ggplot(d, aes(x = log_DAB)) + geom_density()
+max(d$log_DAB) #x10 of control is high?
+
+#High
+d = IHC_GATA3[`TMA core` == "13-9",]
+ggplot(d, aes(x = log_DAB)) + geom_density()
+max(d$log_DAB) #x10 of control is high?
+mean(d$log_DAB)
+median(d$log_DAB)
+min(d$log_DAB)
+
+```
+
+Combine p53 and GATA3 average marker levels for survival model
+```{r p53 and GATA3 average}
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+comb = merge(comb_mean_GATA3[,-"Image"],comb_mean_p53[,-"Image"],by = c("PID"))
+surv_dat = merge(comb,surv_dat,by = c("PID"))
+
+res.cox2 <- coxph(Surv(OS, censoring) ~ mean_expr.x + mean_expr.y, data =  surv_dat)#mean_p53_IMC
+summary(res.cox2)
+
+#Extract model output
+td_coef = as.data.table(tidy(res.cox2,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = sub("cluster_","",td_coef$term)
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+p = ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+surv_dat[order(rev(mean_expr.y),mean_expr.x)]
+max(surv_dat$mean_expr.y)
+
+```
+
+Combine p53 and GATA3 fraction highly expressing cells cells
+```{r p53 and GATA3 fractions}
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+comb = merge(frac_high_p53,frac_high_GATA3,by = c("PID"))
+surv_dat = merge(comb,surv_dat,by = c("PID"))
+
+res.cox2 <- coxph(Surv(OS, censoring) ~ frac_high.x + frac_high.y, data =  surv_dat)#mean_p53_IMC
+summary(res.cox2)
+
+#Extract non zeros
+td_coef = as.data.table(tidy(res.cox2,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = sub("cluster_","",td_coef$term)
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+p = ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+```
+
+Read in IHC quantification data for ER
+```{r IHC ER}
+#ZTMA25 
+IHC_ER = fread('/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/IHC/QuPATH_project_ZTMA25_ER/measurements_ZT25_25_cells.csv',header = T)
+
+#Map core names
+IHC_ER = map_cores(IHC_ER)
+IHC_ER$matched_core = paste0("ZTMA25_",IHC_ER$matched_core)
+
+#Normalize DAB between 0 and 1
+IHC_ER[,`Nucleus: DAB OD mean`:= `Nucleus: DAB OD mean`/max(`Nucleus: DAB OD mean`)]
+IHC_ER$`Nucleus: DAB OD mean`[IHC_ER$`Nucleus: DAB OD mean`<0] = 0
+
+#Calc fractions based on QuPATH quant
+IHC_ER[,ncells := .N,by = "Name"]
+frac_ER = unique(IHC_ER[,c("Image","Name","matched_core","TMA core","ncells")])
+frac_ER[,Class := sub(".*\\ - ", "", Name)]
+frac_ER = dcast.data.table(frac_ER,"Image + `TMA core` + matched_core ~ Class",value.var = "ncells",fill = 0)
+frac_ER[,frac_pos := `Tumor: Positive`/(`Tumor: Positive` + `Tumor: Negative`)]
+
+#Calc mean tumor cell expression values
+mean_ER = IHC_ER[str_detect(Name, "Tumor"),]
+mean_ER[,mean_expr := mean(`Nucleus: DAB OD mean`),by = "TMA core"]
+mean_ER = unique(mean_ER[,c("Image","TMA core","matched_core","mean_expr")])
+
+#Add patient data to IHC
+add = unique(as.data.table(colData(sce_t)[,c("PID","Metadata_Description")]))
+add[,matched_core := paste(strsplit(Metadata_Description,"_")[[1]][c(1,4)],collapse = "_"),by = "Metadata_Description"]
+mean_ER = merge(mean_ER,add,by = "matched_core")
+frac_ER = merge(frac_ER,add,by = "matched_core")
+
+```
+
+Mean expression correlation IMC - IHC ER
+```{r correlation IHC IMC}
+
+#Calc IMC means met
+mean_met_IMC = as.data.table(met_counts[,c("Gd156_Estrogen Receptor Alpha","Metadata_Description")])
+mean_met_IMC[,mean_ER_IMC := mean(`Gd156_Estrogen Receptor Alpha`),by = "Metadata_Description"]
+mean_met_IMC = unique(mean_met_IMC[,c("Metadata_Description","mean_ER_IMC")])
+
+# #Calc IMC means primary
+# mean_prim_IMC = as.data.table(prim_counts[,c("Gd156_Estrogen Receptor Alpha","Metadata_Description")])
+# mean_prim_IMC[,mean_ER_IMC := mean(`Gd156_Estrogen Receptor Alpha`),by = "Metadata_Description"]
+# mean_prim_IMC = unique(mean_prim_IMC[,c("Metadata_Description","mean_ER_IMC")])
+
+#Combine
+comb_mean = merge(mean_ER,mean_met_IMC,by = "Metadata_Description")
+
+#Correlate
+ggplot(comb_mean, aes(x = mean_expr, y = mean_ER_IMC))+ geom_point()+geom_smooth(method = "lm")
+cor(comb_mean$mean_expr,comb_mean$mean_ER_IMC)
+
+```
+
+Survival average expression ER met
+```{r survival average expression}
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+#Combine
+comb_mean_ER = comb_mean[,-c("Metadata_Description","matched_core","TMA core")]
+comb_mean_ER[,mean_expr := mean(mean_expr),by = c("PID","Image")]
+comb_mean_ER[,mean_ER_IMC := mean(mean_ER_IMC),by = c("PID","Image")]
+comb_mean_ER = unique(comb_mean_ER)
+surv_dat = merge(comb_mean_ER,surv_dat,by = c("PID"))
+
+#Mean expression of IMC is not sign
+res.cox2 <- coxph(Surv(OS, censoring) ~ mean_ER_IMC, data =  surv_dat)
+summary(res.cox2)
+
+#Mean expr of IHC is sign
+res.cox2 <- coxph(Surv(OS, censoring) ~ mean_expr, data =  surv_dat)
+summary(res.cox2)
+
+```
+
+Survival frac high ER met
+```{r survival fractions}
+#Define highly expressing cells
+ggplot(IHC_ER, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+IHC_ER$high = 0
+IHC_ER$high[IHC_ER$`Nucleus: DAB OD mean` > 0.4] = 1
+IHC_ER[,nr_high := sum(high),by = "TMA core"]
+
+frac_high = unique(IHC_ER[,c("Image","Name","matched_core","TMA core","ncells","nr_high")])
+frac_high[,Class := sub(".*\\ - ", "", Name)]
+frac_high = dcast.data.table(frac_high,"Image + `TMA core` + matched_core + nr_high ~ Class",value.var = "ncells",fill = 0)
+frac_high = frac_high[,-c("Stroma: Negative","Stroma: Positive")]
+frac_high[,frac_high := nr_high/(`Tumor: Positive` + `Tumor: Negative`)]
+frac_high[is.na(frac_high),frac_high := 0]
+frac_high = merge(frac_high,add,by = "matched_core")
+
+#Combine
+frac_high = frac_high[Metadata_Description %in% LN_cores,]
+frac_high = frac_high[,c("nr_high","PID","frac_high")]
+frac_high[,nr_high := mean(nr_high),by = c("PID")]
+frac_high[,frac_high := mean(frac_high),by = c("PID")]
+frac_high_ER = unique(frac_high)
+surv_dat = merge(frac_high_ER,surv_dat,by = c("PID"))
+
+#Fraction of p53 high cells is strongly associated with worse survival
+res.cox2 <- coxph(Surv(OS, censoring) ~ frac_high, data =  surv_dat)
+summary(res.cox2)
+```
+
+Read in IHC quant for PR
+```{r IHC PR}
+#ZTMA25 
+IHC_PR = fread('/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/IHC/QuPATH_project_ZTMA25_PR/measurements_ZT25_26_cells.csv',header = T)
+
+#Map core names
+IHC_PR = map_cores(IHC_PR)
+IHC_PR$matched_core = paste0("ZTMA25_",IHC_PR$matched_core)
+
+#Normalize DAB between 0 and 1
+IHC_PR[,`Nucleus: DAB OD mean`:= `Nucleus: DAB OD mean`/max(`Nucleus: DAB OD mean`)]
+IHC_PR$`Nucleus: DAB OD mean`[IHC_PR$`Nucleus: DAB OD mean`<0] = 0
+
+#Calc fractions based on QuPATH quant
+IHC_PR[,ncells := .N,by = "Name"]
+frac_PR = unique(IHC_PR[,c("Image","Name","matched_core","TMA core","ncells")])
+frac_PR[,Class := sub(".*\\ - ", "", Name)]
+frac_PR = dcast.data.table(frac_PR,"Image + `TMA core` + matched_core ~ Class",value.var = "ncells",fill = 0)
+frac_PR[,frac_pos := `Tumor: Positive`/(`Tumor: Positive` + `Tumor: Negative`)]
+
+#Calc mean tumor cell expression values
+mean_PR = IHC_PR[str_detect(Name, "Tumor"),]
+mean_PR[,mean_expr := mean(`Nucleus: DAB OD mean`),by = "TMA core"]
+mean_PR = unique(mean_PR[,c("Image","TMA core","matched_core","mean_expr")])
+
+#Add patient data to IHC
+add = unique(as.data.table(colData(sce_t)[,c("PID","Metadata_Description")]))
+add[,matched_core := paste(strsplit(Metadata_Description,"_")[[1]][c(1,4)],collapse = "_"),by = "Metadata_Description"]
+mean_PR = merge(mean_PR,add,by = "matched_core")
+frac_PR = merge(frac_PR,add,by = "matched_core")
+
+```
+
+Mean expression correlation IHC - IMC PR
+```{r correlation IMC IHC}
+#Calc IMC means met
+mean_met_IMC = as.data.table(met_counts[,c("Gd158_Progesterone Receptor A/B","Metadata_Description")])
+mean_met_IMC[,mean_PR_IMC := mean(`Gd158_Progesterone Receptor A/B`),by = "Metadata_Description"]
+mean_met_IMC = unique(mean_met_IMC[,c("Metadata_Description","mean_PR_IMC")])
+
+# #Calc IMC means primary
+# mean_prim_IMC = as.data.table(prim_counts[,c("Gd158_Progesterone Receptor A/B","Metadata_Description")])
+# mean_prim_IMC[,mean_PR_IMC := mean(`Gd158_Progesterone Receptor A/B`),by = "Metadata_Description"]
+# mean_prim_IMC = unique(mean_prim_IMC[,c("Metadata_Description","mean_PR_IMC")])
+
+#Combine
+comb_mean = merge(mean_PR,mean_met_IMC,by = "Metadata_Description")
+
+#Correlate
+ggplot(comb_mean, aes(x = mean_expr, y = mean_PR_IMC))+ geom_point()+geom_smooth(method = "lm")
+cor(comb_mean$mean_expr,comb_mean$mean_PR_IMC)
+
+```
+
+Survival average expression PR met
+```{r survival average expression}
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+#Combine
+comb_mean_PR = comb_mean[,-c("Metadata_Description","matched_core","TMA core")]
+comb_mean_PR[,mean_expr := mean(mean_expr),by = c("PID","Image")]
+comb_mean_PR[,mean_PR_IMC := mean(mean_PR_IMC),by = c("PID","Image")]
+comb_mean_PR = unique(comb_mean_PR)
+surv_dat = merge(comb_mean_PR,surv_dat,by = c("PID"))
+
+#Mean expression of IMC is not sign
+res.cox2 <- coxph(Surv(OS, censoring) ~ mean_PR_IMC, data =  surv_dat)
+summary(res.cox2)
+
+#Mean expr of IHC is sign
+res.cox2 <- coxph(Surv(OS, censoring) ~ mean_expr, data =  surv_dat)
+summary(res.cox2)
+
+```
+
+Survival frac high PR met
+```{r survival fractions high}
+#Define highly expressing cells
+ggplot(IHC_PR, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+IHC_PR$high = 0
+IHC_PR$high[IHC_PR$`Nucleus: DAB OD mean` > 0.4] = 1
+IHC_PR[,nr_high := sum(high),by = "TMA core"]
+
+frac_high = unique(IHC_PR[,c("Image","Name","matched_core","TMA core","ncells","nr_high")])
+frac_high[,Class := sub(".*\\ - ", "", Name)]
+frac_high = dcast.data.table(frac_high,"Image + `TMA core` + matched_core + nr_high ~ Class",value.var = "ncells",fill = 0)
+frac_high = frac_high[,-c("Stroma: Negative","Stroma: Positive")]
+frac_high[,frac_high := nr_high/(`Tumor: Positive`+`Tumor: Negative`)]
+frac_high[is.na(frac_high),frac_high := 0]
+frac_high = merge(frac_high,add,by = "matched_core")
+
+#Combine
+frac_high = frac_high[Metadata_Description %in% LN_cores,]
+frac_high = frac_high[,c("nr_high","PID","frac_high")]
+frac_high[,nr_high := mean(nr_high),by = c("PID")]
+frac_high[,frac_high := mean(frac_high),by = c("PID")]
+frac_high_PR = unique(frac_high)
+surv_dat = merge(frac_high_PR,surv_dat,by = c("PID"))
+
+#Fraction of p53 high cells is strongly associated with worse survival
+res.cox2 <- coxph(Surv(OS, censoring) ~ frac_high, data =  surv_dat)
+summary(res.cox2)
+```
+
+Read in IHC quant for Ki67
+```{r IHC Ki-67}
+#ZTMA25 
+IHC_ki67 = fread('/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/IHC/QuPATH_project_ZTMA25_Ki67/measurements_ZT25_24_cells.csv',header = T)
+
+#Map core names
+IHC_ki67 = map_cores(IHC_ki67)
+IHC_ki67$matched_core = paste0("ZTMA25_",IHC_ki67$matched_core)
+
+#Normalize DAB between 0 and 1
+IHC_ki67[,`Nucleus: DAB OD mean`:= `Nucleus: DAB OD mean`/max(`Nucleus: DAB OD mean`)]
+IHC_ki67$`Nucleus: DAB OD mean`[IHC_ki67$`Nucleus: DAB OD mean`<0] = 0
+
+#Calc fractions based on QuPATH quant
+IHC_ki67[,ncells := .N,by = "Name"]
+frac_ki67 = unique(IHC_ki67[,c("Image","Name","matched_core","TMA core","ncells")])
+frac_ki67[,Class := sub(".*\\ - ", "", Name)]
+frac_ki67 = dcast.data.table(frac_ki67,"Image + `TMA core` + matched_core ~ Class",value.var = "ncells",fill = 0)
+frac_ki67[,frac_pos := `Tumor: Positive`/(`Tumor: Positive` + `Tumor: Negative`)]
+
+#Calc mean tumor cell expression values
+mean_ki67 = IHC_ki67[str_detect(Name, "Tumor"),]
+mean_ki67[,mean_expr := mean(`Nucleus: DAB OD mean`),by = "TMA core"]
+mean_ki67 = unique(mean_ki67[,c("Image","TMA core","matched_core","mean_expr")])
+
+#Add patient data to IHC
+add = unique(as.data.table(colData(sce_t)[,c("PID","Metadata_Description")]))
+add[,matched_core := paste(strsplit(Metadata_Description,"_")[[1]][c(1,4)],collapse = "_"),by = "Metadata_Description"]
+mean_ki67 = merge(mean_ki67,add,by = "matched_core")
+frac_ki67 = merge(frac_ki67,add,by = "matched_core")
+
+```
+
+Mean expression correlation IHC - IMC Ki67
+```{r correlation IHC IMC}
+#Calc IMC means met
+mean_met_IMC = as.data.table(met_counts[,c("Er168_Ki-67","Metadata_Description")])
+mean_met_IMC[,mean_ki67_IMC := mean(`Er168_Ki-67`),by = "Metadata_Description"]
+mean_met_IMC = unique(mean_met_IMC[,c("Metadata_Description","mean_ki67_IMC")])
+
+# #Calc IMC means primary
+# mean_prim_IMC = as.data.table(prim_counts[,c("Er168_Ki-67","Metadata_Description")])
+# mean_prim_IMC[,mean_ki67_IMC := mean(`Er168_Ki-67`),by = "Metadata_Description"]
+# mean_prim_IMC = unique(mean_prim_IMC[,c("Metadata_Description","mean_ki67_IMC")])
+
+#Combine
+comb_mean = merge(mean_ki67,mean_met_IMC,by = "Metadata_Description")
+
+#Correlate
+ggplot(comb_mean, aes(x = mean_expr, y = mean_ki67_IMC))+ geom_point()+geom_smooth(method = "lm")
+cor(comb_mean$mean_expr,comb_mean$mean_ki67_IMC)
+
+```
+
+Survival average expression Ki67 met
+```{r survival average expression}
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+#Combine
+comb_mean_ki67 = comb_mean[,-c("Metadata_Description","matched_core","TMA core")]
+comb_mean_ki67[,mean_expr := mean(mean_expr),by = c("PID","Image")]
+comb_mean_ki67[,mean_ki67_IMC := mean(mean_ki67_IMC),by = c("PID","Image")]
+comb_mean_ki67 = unique(comb_mean_ki67)
+surv_dat = merge(comb_mean_ki67,surv_dat,by = c("PID"))
+
+#Mean expression of IMC is not sign
+res.cox2 <- coxph(Surv(OS, censoring) ~ mean_ki67_IMC, data =  surv_dat)
+summary(res.cox2)
+
+#Mean expr of IHC is sign
+res.cox2 <- coxph(Surv(OS, censoring) ~ mean_expr, data =  surv_dat)
+summary(res.cox2)
+
+```
+
+Survival frac high Ki67 met
+```{r survival fractions high}
+#Define highly expressing cells
+ggplot(IHC_ki67, aes(x = `Nucleus: DAB OD mean`)) + geom_density()
+
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+IHC_ki67$high = 0
+IHC_ki67$high[IHC_ki67$`Nucleus: DAB OD mean` > 0.4] = 1
+IHC_ki67[,nr_high := sum(high),by = "TMA core"]
+
+frac_high = unique(IHC_ki67[,c("Image","Name","matched_core","TMA core","ncells","nr_high")])
+frac_high[,Class := sub(".*\\ - ", "", Name)]
+frac_high = dcast.data.table(frac_high,"Image + `TMA core` + matched_core + nr_high ~ Class",value.var = "ncells",fill = 0)
+frac_high = frac_high[,-c("Stroma: Negative","Stroma: Positive")]
+frac_high[,frac_high := nr_high/(`Tumor: Positive`+`Tumor: Negative`)]
+frac_high[is.na(frac_high),frac_high := 0]
+frac_high = merge(frac_high,add,by = "matched_core")
+
+#Combine
+frac_high = frac_high[Metadata_Description %in% LN_cores,]
+frac_high = frac_high[,c("nr_high","PID","frac_high")]
+frac_high[,nr_high := mean(nr_high),by = c("PID")]
+frac_high[,frac_high := mean(frac_high),by = c("PID")]
+frac_high_ki67 = unique(frac_high)
+surv_dat = merge(frac_high_ki67,surv_dat,by = c("PID"))
+
+#Fraction of p53 high cells is strongly associated with worse survival
+res.cox2 <- coxph(Surv(OS, censoring) ~ frac_high, data =  surv_dat)
+summary(res.cox2)
+```
+
+Combine all markers continuous for survival model
+```{r all markers average expression}
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+#Rename columns
+colnames(comb_mean_GATA3)[colnames(comb_mean_GATA3) == "mean_expr"] = "IHC_GATA3"
+colnames(comb_mean_p53)[colnames(comb_mean_p53) == "mean_expr"] = "IHC_p53"
+colnames(comb_mean_ER)[colnames(comb_mean_ER) == "mean_expr"] = "IHC_ER"
+colnames(comb_mean_PR)[colnames(comb_mean_PR) == "mean_expr"] = "IHC_PR"
+colnames(comb_mean_ki67)[colnames(comb_mean_ki67) == "mean_expr"] = "IHC_ki67"
+
+comb = merge(comb_mean_GATA3[,-"Image"],comb_mean_p53[,-"Image"],by = c("PID"))
+comb = merge(comb,comb_mean_ER[,-"Image"],by = c("PID"))
+comb = merge(comb,comb_mean_PR[,-"Image"],by = c("PID"))
+comb = merge(comb,comb_mean_ki67[,-"Image"],by = c("PID"))
+
+surv_dat = merge(comb,surv_dat,by = c("PID"))
+res.cox2 <- coxph(Surv(OS, censoring) ~ IHC_GATA3 + IHC_p53 + IHC_ER + IHC_PR + IHC_ki67, data =  surv_dat)
+summary(res.cox2)
+
+#Extract non zeros
+td_coef = as.data.table(tidy(res.cox2,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = sub("cluster_","",td_coef$term)
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+p = ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+p
+
+#Model better with p53 and GATA3 is significantly better
+model1 = coxph(Surv(OS, censoring) ~ IHC_ER + IHC_PR + IHC_ki67, data =  surv_dat)
+model2 = coxph(Surv(OS, censoring) ~ IHC_GATA3 + IHC_p53 + IHC_ER + IHC_PR + IHC_ki67, data =  surv_dat)
+anova(model1,model2)
+
+```
+
+Combine all markers fraction high cells
+```{r all markers fractions high}
+#Survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+#Rename columns
+colnames(frac_high_GATA3)[colnames(frac_high_GATA3) == "frac_high"] = "IHC_GATA3"
+colnames(frac_high_p53)[colnames(frac_high_p53) == "frac_high"] = "IHC_p53"
+colnames(frac_high_ER)[colnames(frac_high_ER) == "frac_high"] = "IHC_ER"
+colnames(frac_high_PR)[colnames(frac_high_PR) == "frac_high"] = "IHC_PR"
+colnames(frac_high_ki67)[colnames(frac_high_ki67) == "frac_high"] = "IHC_ki67"
+
+comb = merge(frac_high_p53[,-"nr_high"],frac_high_GATA3[,-"nr_high"],by = c("PID"))
+comb = merge(comb,frac_high_ER[,-"nr_high"],by = c("PID"))
+comb = merge(comb,frac_high_PR[,-"nr_high"],by = c("PID"))
+comb = merge(comb,frac_high_ki67[,-"nr_high"],by = c("PID"))
+
+surv_dat = merge(comb,surv_dat,by = c("PID"))
+res.cox2 <- coxph(Surv(OS, censoring) ~ IHC_GATA3 + IHC_p53 + IHC_ER + IHC_PR + IHC_ki67, data =  surv_dat)
+summary(res.cox2)
+
+#Extract non zeros
+td_coef = as.data.table(tidy(res.cox2,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = sub("cluster_","",td_coef$term)
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+p = ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+p
+
+#Model better with p53 and GATA3 is significantly better
+model1 = coxph(Surv(OS, censoring) ~ IHC_ER + IHC_PR + IHC_ki67, data =  surv_dat, x = T, y = T)
+model2 = coxph(Surv(OS, censoring) ~ IHC_GATA3 + IHC_p53 + IHC_ER + IHC_PR + IHC_ki67, data =  surv_dat, x = T, y = T)
+anova(model1,model2)
+
+#Variance explained... not a whole lot
+library(PAmeasures)
+pam.coxph(model2)
+
+```
+
+Whole slide validation analysis
+
+Read in all of the single-cell data tsv's and calculate average expression/ highly expressing cells
+```{r}
+#All project tsvs for each patient
+files <- list.files("/mnt/Validation_LNmets/singlecelldat/")
+
+#Read in all cells and set thresholds over all
+out <- list()
+counter <- 1
+for (i in files){
+  d <- fread(paste0("/mnt/Validation_LNmets/singlecelldat/",i))
+  d <- d[,c("Image","Nucleus: DAB OD mean","Cell: DAB OD mean","Nucleus: Area","Cell: Area")]
+  out[[counter]]<- d
+  counter = counter + 1
+}
+d <- do.call(rbind, out)
+out <- NULL
+
+#Name corrections
+d[Image == "GATA3_2613LN-1.czi",Image := "PR_2613LN.czi"]
+d[str_detect(Image,"3921LN-1.czi"),Image := gsub("-1.czi","2.czi",Image)]
+d[str_detect(Image," - Scene #0"),Image := gsub(" - Scene #0","",Image)]
+
+#Extract marker and PID and nr LN from image name
+d[,marker := gsub("_.*","",Image)]
+d[marker == "KI67",marker := "Ki67"]
+d[marker == "P53",marker := "p53"]
+d[,PID := gsub(".*_","",Image)]
+d[,PID := gsub(".czi","",PID)]
+d[,nLN := gsub(".*LN","",PID)]
+d[nLN == "",nLN := "1"]
+d[,PID := gsub("LN.*","",PID)]
+
+#More cleaning vs metadta
+d[PID == "3242",PID := "3243"]
+
+#Kick all black stains out
+d <- d[!(PID == "776" & marker == "HER2"),]
+d <- d[PID != "4085",]
+
+#Filter out very small (immune) cells that may have been captured in ROI accidentally
+#ggplot(d,aes(x = asinh(`Nucleus: Area`)))+geom_density()+facet_wrap(~marker)
+#d <- d[asinh(`Nucleus: Area`) > 3.5,]
+
+#Extract number of cells (should only be tumor cells due to ROI selection)
+d[,ncells := .N, by = c("Image")]
+
+#Arcsinh transform cell means
+d[,arcsinh := asinh(`Cell: DAB OD mean`/0.5)]
+
+#Average tumor cell expression levels per image(for patient average averages of individual images bellow because when there are multiple LNs per patient not the same number of cells are sampled of each LN)
+#Average on raw counts, not arcsinh transformed (as in TMAs above)!
+d[,avgImage := mean(`Cell: DAB OD mean`,na.rm = T), by = c("Image")]
+
+#Fraction of highly expression cells (check if raw or arcsinh thresh better)
+d$HiLo <- "low"
+d[arcsinh > 0.5, HiLo := "high"]
+d[,N := .N,by = c("Image","HiLo")]
+d[,frac := N/.N,by = c("Image")]
+
+#Single-cell distributions
+ggplot(d,aes(x = arcsinh))+geom_density()+facet_wrap(~marker)
+```
+
+How different are multiple LNs of the same patient?
+```{r}
+#Get patients with multiple LNs
+mult <- unique(d[,c("PID","nLN")])
+mult[,nr := .N,by = "PID"]
+mult <- mult[nr > 1,]
+mult <- unique(d[PID %in% unique(mult$PID),c("PID","nLN","avgImage","marker","Image")])
+
+#Normalize the image means per marker because otherwise markers that are expressed in all cells get much higher image means than markers like Ki67 -> higher variability across different LNs
+normalize01 <- function(x, na.rm = TRUE) {
+    return((x- min(x)) /(max(x)-min(x)))
+}
+mult[,avgImageNorm := normalize01(avgImage),by = marker]
+mult[,avgPID := mean(avgImageNorm,na.rm = T), by = c("PID","marker")]
+mult <- dcast.data.table(mult, "PID + marker + avgPID ~ nLN",value.var = "avgImageNorm")
+setnames(mult,"1","LN1")
+setnames(mult,"2","LN2")
+setnames(mult,"3","LN3")
+
+#Calculate standard deviation to mean across images of patient
+mult[is.na(LN3),stDeviation := sqrt(((avgPID - LN1)^2 + (avgPID - LN2)^2)/2)]
+mult[!is.na(LN3),stDeviation := sqrt(((avgPID - LN1)^2 + (avgPID - LN2)^2 + (avgPID - LN3)^2)/3)]
+mult[is.na(LN1),stDeviation := sqrt(((avgPID - LN2)^2 + (avgPID - LN3)^2)/2)]
+
+ggplot(mult,aes(x = avgPID,color = marker)) +geom_density()
+
+ggplot(mult,aes(y = stDeviation,x = marker))+geom_boxplot()
+
+ggplot(mult,aes(x = avgPID,y = stDeviation))+geom_point()+facet_wrap(~marker)
+
+```
+
+Read metadata
+```{r}
+library("readxl")
+meta = read_excel("/mnt/Validation_LNmets/metadata_final.xlsx")
+meta = as.data.table(meta)
+
+#Clean censoring
+meta$censoring = 0
+meta[(`Reconsent Ja/Nein` == "verstorben") & (`mBC_JA-NEIN` == "J" | `mBC_JA-NEIN` == "pM1" | `mBC_JA-NEIN` == "OSt < 50 m"),censoring := 1]
+#meta[`Reconsent Ja/Nein` == "verstorben",censoring := 1] #more dead -> even clearer to illustrate non-prop hazard -> some aspects even more significant
+
+#Clean OS
+setnames(meta,"OS time in month", "OS")
+meta[OS == "na", OS := NA]
+meta$OS = as.numeric(meta$OS)
+
+#Clean molecular subtype
+meta[,pN := substr(N,1,4)]
+meta[(ER_NEGPOS == "P" | PR_NEGPOS == "P")&HER2_NEGPOS == "P",mol := "HR+HER2+"]
+meta[(ER_NEGPOS == "P" | PR_NEGPOS == "P")&HER2_NEGPOS == "N",mol := "HR+HER2-"]
+meta[(ER_NEGPOS == "N" & PR_NEGPOS == "N")&HER2_NEGPOS == "P",mol := "HR-HER2+"]
+meta[(ER_NEGPOS == "N" & PR_NEGPOS == "N")&HER2_NEGPOS == "N",mol := "TripleNeg"]
+
+setnames(meta, "LFDN","PID")
+meta[,PID := as.character(PID)]
+
+#So it doesn't mess with model later (in case of log transforms)
+meta[OS == 0,OS := 1]
+
+#Limit to only those we have samples for
+sub = meta[PID %in% unique(d$PID),]
+
+#How many deaths
+nrow(sub[censoring == 1,])
+nrow(sub[(`Reconsent Ja/Nein` == "verstorben"),])
+
+#Survival curves
+SurvObj <- Surv(sub$OS, sub$censoring)
+km.as.one <- survfit(SurvObj ~ 1)
+plot(km.as.one,mark.time = T,col = "black")
+
+#Check Grade survival
+par(mfrow=c(3,2))
+for (i in sort(unique(sub$G))){
+  cur_dat = subset(sub, sub$G == i)
+  if (nrow(cur_dat) > 1){
+  SurvObj_cur <- Surv(cur_dat$OS, cur_dat$censoring)
+  km.cur.group <- survfit(SurvObj_cur ~ 1)
+  plot(km.cur.group,mark.time = T,col = "red",xlim=range(1:210))
+  par(new=TRUE)
+  plot(km.as.one,mark.time = T,col = "black",xlim=range(1:210))
+  legend("bottomleft",1,i,"red", cex=0.5)}
+}
+
+#N
+par(mfrow=c(3,2))
+for (i in sort(unique(sub$pN))){
+  cur_dat = subset(sub, sub$pN == i)
+  if (nrow(cur_dat) > 1){
+  SurvObj_cur <- Surv(cur_dat$OS, cur_dat$censoring)
+  km.cur.group <- survfit(SurvObj_cur ~ 1)
+  plot(km.cur.group,mark.time = T,col = "red",xlim=range(1:210))
+  par(new=TRUE)
+  plot(km.as.one,mark.time = T,col = "black",xlim=range(1:210))
+  legend("bottomleft",1,i,"red", cex=0.5)}
+}
+
+#mol
+par(mfrow=c(3,2))
+for (i in sort(unique(sub$mol))){
+  cur_dat = subset(sub, sub$mol == i)
+  if (nrow(cur_dat) > 1){
+  SurvObj_cur <- Surv(cur_dat$OS, cur_dat$censoring)
+  km.cur.group <- survfit(SurvObj_cur ~ 1)
+  plot(km.cur.group,mark.time = T,col = "red",xlim=range(1:210))
+  par(new=TRUE)
+  plot(km.as.one,mark.time = T,col = "black",xlim=range(1:210))
+  legend("bottomleft",1,i,"red", cex=0.5)}
+}
+
+#Distributions of metadata
+sub[,nG := .N,by = "G"]
+sub[,nN := .N,by = "pN"]
+sub[,nmBC := .N,by = "censoring"]
+sub[,nmol := .N,by = "mol"]
+
+p = unique(sub[,c("G","nG")])
+g1 = ggplot(p,aes(x = as.factor(1),y = nG, fill = G))+geom_bar(stat = "identity")+scale_fill_grey()+
+  theme(aspect.ratio = 2)+
+  ggtitle("Grade")
+
+p = unique(sub[,c("pN","nN")])
+g2 = ggplot(p,aes(x = as.factor(1),y = nN, fill = pN))+geom_bar(stat = "identity")+scale_fill_grey()+
+  theme(aspect.ratio = 2)+
+  ggtitle("pN")
+
+        
+p = unique(sub[,c("mol","nmol")])
+g3 = ggplot(p,aes(x = as.factor(1),y = nmol, fill = mol))+geom_bar(stat = "identity")+scale_fill_grey()+
+  theme(aspect.ratio = 2)+
+  ggtitle("mol")
+
+g1 + g2 + g3
+
+
+```
+
+Average marker expression and fraction high expressing per patient
+```{r}
+#Average expressions per patient
+avgs <- unique(d[,c("PID","marker","avgImage","Image")])
+avgs[,avgPID := mean(avgImage,na.rm = T), by = c("PID","marker")]
+avgs[,maxPID := max(avgImage,na.rm = T), by = c("PID","marker")]#Use highest value for each marker because sometimes certain LNs stain badly or contain no real tumor cells
+avgs <- unique(avgs[,-c("Image","avgImage")])
+avgs <- dcast.data.table(avgs,"PID ~ marker",value.var = "maxPID")
+
+# #Fix NAs as in the middle of the negative peak when negative but blurred
+# avgs[PID == "3823",HER2 := 0.1]
+# avgs[PID == "3198",GATA3 := 0.1]
+
+cor(na.omit(avgs[,-"PID"]))
+
+#Fraction highly expressing per patient
+frac <- unique(d[,c("PID","marker","frac","HiLo","Image")])
+frac <- frac[HiLo == "high",]
+frac[,avgfracPID := mean(frac,na.rm = T), by = c("PID","marker")]
+frac[,maxfracPID := max(frac,na.rm = T), by = c("PID","marker")]
+frac <- unique(frac[,-c("Image","frac","HiLo")])
+frac <- dcast.data.table(frac,"PID ~ marker",value.var = "maxfracPID")
+frac[is.na(frac)] = 0
+
+cor(na.omit(frac[,-"PID"]))
+
+```
+
+Survival avg tumor cell expressions of p53 and GATA3
+```{r}
+#Try regular coxph without accounting for non-proportional hazards over time of p53
+comb <- merge(avgs,meta,all.x = T,by = "PID")
+
+res.cox1 <- coxph(Surv(OS, censoring) ~ p53, data =  comb)
+summary(res.cox1)
+
+res.cox2 <- coxph(Surv(OS, censoring) ~ GATA3, data =  comb)
+summary(res.cox2)
+
+res.cox3 <- coxph(Surv(OS, censoring) ~ GATA3 + p53, data =  comb)
+summary(res.cox3)
+
+#Extract model output
+td_coef = as.data.table(tidy(res.cox3,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+#Test assumptions
+test.ph <- cox.zph(res.cox3) #p53 does not have proportional hazard -> residuals have significant relationship wit time
+test.ph
+ggcoxzph(test.ph[2])
+
+#Make time strata for p53 -> treat as time dependent coefficient (https://cran.r-project.org/web/packages/survival/vignettes/timedep.pdf, page 16 -> step functions)
+comb2 <- survSplit(Surv(OS, censoring) ~ ., data= comb, cut=c(30),
+episode= "tgroup", id="id")
+stratfit <- coxph(Surv(tstart, OS, censoring) ~ GATA3 + p53:strata(tgroup), data=comb2)
+summary(stratfit)
+
+#Extract model output
+td_coef = as.data.table(tidy(stratfit,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+#Alternatively time transform functionality https://cran.r-project.org/web/packages/survival/vignettes/timedep.pdf page 20
+vfit3 <- coxph(Surv(OS, censoring) ~ GATA3 + p53 + tt(p53),
+data=comb,tt = function(x, t, ...) x * log(t+10))
+summary(vfit3)
+
+#Extract model output
+td_coef = as.data.table(tidy(vfit3,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+
+#Show survival curves for high/low p53
+ggplot(comb,aes(x = p53))+geom_density()
+comb$p53high = "no"
+comb[p53 > 0.3,p53high := "yes"]
+
+fit <- survfit(Surv(OS, censoring) ~ factor(p53high), data =  comb)
+ggsurvplot(fit, data = comb,conf.int = FALSE,pval = TRUE,risk.table = TRUE)
+
+
+#Show survival curves for high/low GATA3
+ggplot(comb,aes(x = GATA3))+geom_density()
+comb$GATA3high = "no"
+comb[GATA3 > 0.4,GATA3high := "yes"]
+
+fit <- survfit(Surv(OS, censoring) ~ factor(GATA3high), data =  comb)
+ggsurvplot(fit, data = comb,conf.int = FALSE,pval = TRUE,risk.table = TRUE)
+
+#Show survival curves for high GATA3 and low p53
+comb$progn <- NULL
+comb[GATA3high == "yes" & p53high == "no",progn := "good"]
+comb[GATA3high == "no" & p53high == "yes",progn := "bad"]
+
+fit <- survfit(Surv(OS, censoring) ~ progn, data =  comb)
+ggsurvplot(fit, data = comb,conf.int = FALSE,pval = TRUE,risk.table = TRUE)
+
+
+```
+
+Combine with clinical classifications
+```{r}
+#Set ref levels
+comb[, G := factor(G,levels = c("G3","G2","G1"))]
+comb[,mol := factor(mol,levels = c("HR+HER2-","TripleNeg","HR+HER2+","HR-HER2+"))]
+
+#Use strata p53
+comb2 <- survSplit(Surv(OS, censoring) ~ ., data= comb, cut=c(30),
+episode= "tgroup", id="id")
+
+#Without pN
+stratfit <- coxph(Surv(tstart, OS, censoring) ~ GATA3 + p53:strata(tgroup) + G + mol, data=comb2)
+summary(stratfit)
+
+#Extract model output
+td_coef = as.data.table(tidy(stratfit,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+#Does adding p53 and GATA3 improve the model? Subset to only those with p53 and GATA3 so models have same size
+comb2 = as.data.table(comb2)
+comb2 <- comb2[!is.na(p53) & !is.na(GATA3),]
+fit1 <- coxph(Surv(tstart, OS, censoring) ~  G + mol, data=comb2)
+fit2 <- coxph(Surv(tstart, OS, censoring) ~ GATA3 + p53:strata(tgroup) + G + mol, data=comb2)
+
+#Yes, it does improve the model!
+anova(fit1,fit2)
+
+
+#With pN
+stratfit <- coxph(Surv(tstart, OS, censoring) ~ GATA3 + p53:strata(tgroup) + G + mol + pN, data=comb2)
+summary(stratfit)
+
+#Extract model output
+td_coef = as.data.table(tidy(stratfit,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+#Does adding p53 and GATA3 improve the model? Subset to only those with p53 and GATA3 so models have same size
+fit1 <- coxph(Surv(tstart, OS, censoring) ~  G + mol +pN, data=comb2)
+fit2 <- coxph(Surv(tstart, OS, censoring) ~ GATA3 + p53:strata(tgroup) + G + mol + pN, data=comb2)
+
+#Yes, it does improve the model! And only if both are added (not just p53)
+anova(fit1,fit2)
+
+
+#Show boxplots of p53 expressions across clinical groups
+long <- melt.data.table(comb[,c("PID","mol","G","pN","ER","PR","HER2.x","Ki67","GATA3","p53")],id.vars = c("PID","mol","G","pN"),variable.name = "marker")
+ggplot(long,aes(x = mol,y = value, fill = marker))+geom_boxplot()
+ggplot(long,aes(x = G,y = value, fill = marker))+geom_boxplot()
+ggplot(long,aes(x = pN,y = value, fill = marker))+geom_boxplot()
+
+```
+
+Combine with clinical markers in LN
+```{r}
+#markers only
+stratfit <- coxph(Surv(tstart, OS, censoring) ~ GATA3 + p53:strata(tgroup) + ER + PR + HER2.x + Ki67, data=comb2)
+summary(stratfit)
+
+#Extract model output
+td_coef = as.data.table(tidy(stratfit,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+#Does adding p53 and GATA3 improve the model?
+fit1 <- coxph(Surv(tstart, OS, censoring) ~  ER + PR + HER2.x + Ki67, data=comb2)
+fit2 <- coxph(Surv(tstart, OS, censoring) ~ GATA3 + p53:strata(tgroup) + ER + PR + HER2.x + Ki67, data=comb2)
+
+#Nope
+anova(fit1,fit2)
+
+
+#Accounting for non-proportional hazards of Ki67 -> p53 and GATA3 add nothing anymore
+test.ph <- cox.zph(stratfit) #Ki67 also does not have proportional hazard
+test.ph
+ggcoxzph(test.ph[5])
+
+#markers only
+stratfit <- coxph(Surv(tgroup, OS, censoring) ~ GATA3 + Ki67:strata(tgroup) + p53:strata(tgroup) + ER + PR + HER2.x, data=comb2)
+summary(stratfit)
+
+#Extract model output
+td_coef = as.data.table(tidy(stratfit,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+#Does adding p53 and GATA3 improve the model?
+fit1 <- coxph(Surv(tstart, OS, censoring) ~  ER + PR + HER2.x + Ki67:strata(tgroup), data=comb2)
+fit2 <- coxph(Surv(tstart, OS, censoring) ~ GATA3 + p53:strata(tgroup) + ER + PR + HER2.x + Ki67:strata(tgroup), data=comb2)
+
+#Nope
+anova(fit1,fit2)
+
+#Including clinical classifications
+stratfit <- coxph(Surv(tstart, OS, censoring) ~ GATA3 + p53:strata(tgroup) + ER + PR + HER2.x + Ki67+ G + mol + pN, data=comb2)
+summary(stratfit)
+
+#Extract model output
+td_coef = as.data.table(tidy(stratfit,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+#Does adding p53 and GATA3 improve the model?
+fit1 <- coxph(Surv(tstart, OS, censoring) ~  ER + PR + HER2.x + Ki67+ G + mol + pN, data=comb2)
+fit2 <- coxph(Surv(tstart, OS, censoring) ~ GATA3 + p53:strata(tgroup) + ER + PR + HER2.x + Ki67+ G + mol + pN, data=comb2)
+
+#Nope but close
+anova(fit1,fit2)
+
+```
+
+Check out PCA across markers
+```{r}
+library(factoextra)
+p <- comb[,c("ER","PR","HER2.x","Ki67","GATA3","p53")]
+
+res.pca <- prcomp(na.omit(p), scale = TRUE)
+fviz_eig(res.pca)
+fviz_pca_var(res.pca,axes = c(1, 2),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+fviz_pca_var(res.pca,axes = c(1, 3),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+fviz_pca_var(res.pca,axes = c(2, 3),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+fviz_pca_var(res.pca,axes = c(1, 4),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+
+#Survival
+combnona <- comb[!is.na(ER) & !is.na(PR) & !is.na(HER2.x) & !is.na(GATA3) & !is.na(Ki67) & !is.na(p53)]
+combnona <- cbind(combnona[,-c("ER","PR","HER2.x","Ki67","GATA3","p53")],res.pca$x)
+
+
+#Including clinical classifications
+fit <- coxph(Surv(OS, censoring) ~ PC1 + PC2 + PC3, data=combnona)
+summary(fit)
+
+#Extract model output
+td_coef = as.data.table(tidy(fit,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+
+#Try without p53 and GATA3
+p <- comb[,c("ER","PR","HER2.x","Ki67")]
+
+res.pca <- prcomp(na.omit(p), scale = TRUE)
+fviz_eig(res.pca)
+fviz_pca_var(res.pca,axes = c(1, 2),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+fviz_pca_var(res.pca,axes = c(1, 3),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+fviz_pca_var(res.pca,axes = c(2, 3),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+
+#Survival
+combnona <- comb[!is.na(ER) & !is.na(PR) & !is.na(HER2.x) & !is.na(Ki67)]
+combnona <- cbind(combnona[,-c("ER","PR","HER2.x","Ki67","GATA3","p53")],res.pca$x)
+
+#Including clinical classifications
+fit <- coxph(Surv(OS, censoring) ~ PC1 + PC2 + PC3, data=combnona)
+summary(fit)
+
+#Extract model output
+td_coef = as.data.table(tidy(fit,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+```
+
+

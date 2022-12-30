@@ -1,0 +1,392 @@
+---
+title: "Analysis_pipeline1"
+author: "Jana Fischer"
+date: "1/30/2020"
+output: html_document
+---
+
+Clean single-cell data and perform first analysis steps, including distinguishing tumor and stromal cells and dimensionality reduction.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+library(data.table)
+library(SingleCellExperiment)
+library(ggplot2)
+library(mclust)
+library(RColorBrewer)
+library(scater)
+library(plyr)
+library(viridis)
+library(ggrastr)
+library(ComplexHeatmap)
+library(circlize)
+
+```
+
+Read SCE with single-cell data and clean single-cell data.
+```{r,eval = FALSE}
+#Set global seed
+set.seed(3)
+
+#Read in single cell experiment created in CP_to_SCE.Rmd
+sce = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE.rds')
+
+#Exclude second Iridium channel (don't need it for single-cell analysis)
+sce = sce[rownames(sce)[!rownames(sce) %in% c("Ir191_Iridium")],]
+
+#Flag very small or very big cells as potential missegmentations (excluded from most analyses)
+sce$sizeflag[sce$AreaShape_Area >= 700] = 1
+sce$sizeflag[sce$AreaShape_Area <= 10] = 1
+sce$sizeflag[is.na(sce$sizeflag)] = 0
+
+#Exclude split image with two half cores (unclear from which TMA location)
+sce = subset(sce,,core != "ZTMA21.3_s0_p3_r10_a10")
+
+#Exclude much too small images (created due to machine interruprions)
+sce = subset(sce,,core != "ZTMA26.1_s0_p3_r38_a38") #narrow stripe
+sce = subset(sce,,core != "ZTMA21.1_s0_p3_r162_a162") #tiny tile
+
+#Save batch nr as metadata (not just which TMA but also which acquisition round)
+sce$ArrayNr_batch = sub("_s.*", "",sce$core)
+
+#Check for bad stains (looking at images and their cell types as well as metadata showed no systematic badly stained cores)
+d = as.data.table(t(counts(sce)))
+d$id = colnames(sce)
+d$core = sce$core
+d$meta = sce$Metadata_Description #holds info about TMA location and split cores
+d[,meanIr := mean(Ir193_Iridium),by = "core"]
+d[,meanHist := mean(`In113_Histone H3`),by = "core"]
+d$comb_nuc = d$meanHist + d$meanIr
+d = unique(d[,c("comb_nuc","core","meta")])
+
+ggplot(d,aes(x = comb_nuc))+geom_density()
+
+#Images visually inspected
+quant = quantile(d$comb_nuc,0.05)
+d[comb_nuc < quant]
+
+```
+
+Run a granular PG on all cells and a gaussian mixture model on panCK to distinguish tumor vs stromal cells.
+```{r,eval = FALSE}
+#Set global seed
+set.seed(3)
+
+#Run PG
+rpheno_out = cytofkit::Rphenograph(t(counts(sce)), k = 50, seed = 3, approx=T)
+sce$PG_clusters = as.factor(igraph::membership(rpheno_out))
+
+#Gaussian mixture model to distinguish tumor/stroma based on panCK expression
+mcl.model <- densityMclust(t(counts(sce))[,"Lu175_Keratin Epithelial"], 2)
+sce$GMM_class = mcl.model$classification
+
+#Save another SCE with PG output included (so this slow step doesn't have to be rerun)
+saveRDS(sce, file = '/mnt/ZTMA_21_25_26/analysis/SCE_PG.rds', ascii = FALSE)
+
+```
+
+Read saved SCE with above clustering info already contained and define frequently used colormaps
+```{r}
+#In case this wasn't already set
+set.seed(3)
+
+#Read in sce with PG info already contained
+sce = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_PG.rds')
+
+#Define general color map of distinguishable colors
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+col_vector = unique(col_vector)
+
+#Define colormaps for the frequently used metadata
+#Molecular subtype
+cols_mol = unique(as.data.table(sce$Mol_Signature))
+cols_mol$col = c("pink","violet","black","turquoise","orange","purple","white")
+names(cols_mol)[1] = "Mol_Signature"
+
+#Pathology grade
+cols_grade = unique(as.data.table(sce$Grade))
+cols_grade$col = c("red","green","blue","white","black")
+names(cols_grade)[1] = "Grade"
+
+#Nodal status
+cols_pN_4gr = unique(as.data.table(sce$pN_4gr))
+cols_pN_4gr$col = brewer.pal(nrow(cols_pN_4gr), "OrRd")
+names(cols_pN_4gr)[1] = "pN_4gr"
+cols_pN_4gr$col[is.na(cols_pN_4gr$pN_4gr)] = "black"
+cols_pN_4gr$col[cols_pN_4gr$pN_4gr == "7"] = "grey"
+
+#Tissue type
+cols_tissue = unique(as.data.table(sce$TissueType))
+names(cols_tissue) = "TissueType"
+cols_tissue$col = c("steelblue1","orange","black","purple","darkgreen","yellow","red")
+
+#Write out color maps for following scripts
+fwrite(cols_mol,"/mnt/ZTMA_21_25_26/analysis/cols_mol.csv",col.names = T)
+fwrite(cols_grade,"/mnt/ZTMA_21_25_26/analysis/cols_grade.csv",col.names = T)
+fwrite(cols_pN_4gr,"/mnt/ZTMA_21_25_26/analysis/cols_pN_4gr.csv",col.names = T)
+fwrite(cols_tissue,"/mnt/ZTMA_21_25_26/analysis/cols_tissue",col.names = T)
+
+```
+
+Plot gaussian mixture model
+```{r}
+d = data.table(gMM = sce$GMM_class,panCK = t(assay(sce["Lu175_Keratin Epithelial",],type = "raw")))
+d$`panCK.Lu175_Keratin Epithelial` = asinh(d$`panCK.Lu175_Keratin Epithelial`)
+
+ggplot(d,aes(x=`panCK.Lu175_Keratin Epithelial`,fill = as.factor(gMM)))+geom_density()
+
+```
+
+Run t-SNE and UMAP dimensionality reductions
+```{r,eval = F}
+#In case this wasn't already set
+set.seed(3)
+
+#Register how many cores to use for parallelization
+require(doParallel)
+options('mc.cores' = 20)
+registerDoParallel(20)
+
+#Subsample 10% of cells from each core to save time and not get super crowded dimensionality reduction plots
+sub = colData(sce)[c('core')]
+sub$id = rownames(sub)
+sub = as.data.table(sub)
+sub = ddply(sub,.(core),function(x) x[sample(nrow(x),nrow(x)/10, replace = F),])
+sce_sub = sce[,sub$id]
+
+#Run umap and tsne and save output directly into subsampled SCE
+sce_sub = runUMAP(sce_sub, exprs_values = "counts", external_neighbors=TRUE, BPPARAM = MulticoreParam())
+sce_sub = runTSNE(sce_sub, exprs_values = "counts", external_neighbors=TRUE, BPPARAM = MulticoreParam())
+
+#Save subsampled SCE including the dimensionality reduction info so this step doesn't have to be repeated
+saveRDS(sce_sub, file = '/mnt/ZTMA_21_25_26/analysis/SCE_sub_dimRed.rds', ascii = FALSE)
+```
+
+Plot t-SNEs and UMAPs
+```{r}
+#Read in subsampeled sce with dim red info already contained
+sce_sub = readRDS(file = '/mnt/ZTMA_21_25_26/analysis/SCE_sub_dimRed.rds')
+
+#Add dummy variable consisting of all same entries because the default shape of plotReducedDim is ugly
+sce_sub$dummy = 1
+
+#Order factors according to color order
+sce_sub$Mol_Signature = factor(sce_sub$Mol_Signature, levels = cols_mol$Mol_Signature)
+sce_sub$Grade = factor(sce_sub$Grade, levels = cols_grade$Grade)
+sce_sub$pN_4gr = factor(sce_sub$pN_4gr, levels = cols_pN_4gr$pN_4gr)
+sce_sub$TissueType = factor(sce_sub$TissueType, levels = cols_tissue$TissueType)
+
+#UMAPs
+red = as.data.table(reducedDims(sce_sub)$UMAP)
+shuffle = sample(nrow(red),replace = F) #shuffle points so all colors visible
+
+#Plot density of points on UMAP
+ggplot(red, aes(x=V1, y=V2))+
+  stat_bin2d(aes(color=..count..), bins=300, geom='point', size=1.4, fill=1)+
+  scale_color_viridis(trans = "log10", option='inferno')
+
+#Tissue type
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$TissueType[shuffle]))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = cols_tissue[!is.na(TissueType)]$col)+
+  theme_minimal()
+
+#PID
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$PID[shuffle]))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = rep(col_vector,ceiling(length(unique(sce_sub$PID))/length(col_vector))))+
+  theme_minimal()+ theme(legend.position = "none")
+
+#Batch
+TMAcols = c(colors()[grep("steelblue",colors())][1:4],
+            colors()[grep("purple",colors())][1:4],
+            colors()[grep("steelblue",colors())][5:7])
+
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$ArrayNr_batch[shuffle]))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = TMAcols)+
+  theme_minimal()
+
+#Slide
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$ArrayNr[shuffle]))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = col_vector)+
+  theme_minimal()
+
+#Grade
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$Grade[shuffle]))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = cols_grade[!is.na(Grade)]$col)+
+  theme_minimal()
+
+#Molecular subtype
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$Mol_Signature[shuffle]))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = cols_mol$col)+
+  theme_minimal()
+
+#GMM class
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = as.factor(sce_sub$class[shuffle])))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = col_vector)
+
+#Size flag
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = as.factor(sce_sub$sizeflag[shuffle])))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = col_vector)+
+  theme_minimal()
+
+#Plot UMAPs overlayed with expression values
+par(mfrow=c(ceiling(length(rownames(sce_sub))/3),3))
+lapply(rownames(sce_sub),function(x){plotReducedDim(sce_sub, dimred = "UMAP", shape_by = "dummy", by_exprs_values = "counts", colour_by = x)})
+
+
+#t-SNEs
+red = as.data.table(reducedDims(sce_sub)$TSNE)
+shuffle = sample(nrow(red),replace = F) #shuffle points so all colors visible
+
+#Plot density of points on tSNE
+ggplot(red, aes(x=V1, y=V2))+
+  stat_bin2d(aes(color=..count..), bins=300, geom='point', size=1.4, fill=1)+
+  scale_color_viridis(trans = "log10", option='inferno')
+
+#Tissuetype
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$TissueType[shuffle]))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = cols_tissue[!is.na(TissueType)]$col)+
+  theme_minimal()
+
+#PID
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$PID[shuffle]))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = rep(col_vector,ceiling(length(unique(sce_sub$PID))/length(col_vector))))+
+  theme_minimal()+ theme(legend.position = "none")
+
+#Batch
+TMAcols = c(colors()[grep("steelblue",colors())][1:4],
+            colors()[grep("purple",colors())][1:4],
+            colors()[grep("steelblue",colors())][5:7])
+
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$ArrayNr_batch[shuffle]))+
+  geom_point_rast(size = 0.2,alpha = 0.5)+
+  scale_color_manual(values = TMAcols)+
+  theme_minimal()
+
+#Slide
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$ArrayNr[shuffle]))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = col_vector)+
+  theme_minimal()
+
+#Grade
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$Grade[shuffle]))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = cols_grade[!is.na(Grade)]$col)+
+  theme_minimal()
+
+#Clinical type
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$Mol_Signature[shuffle]))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = cols_mol$col)+
+  theme_minimal()
+
+#GMM class
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = as.factor(sce_sub$class[shuffle])))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = col_vector)
+
+#Size flag
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = as.factor(sce_sub$sizeflag[shuffle])))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = col_vector)+
+  theme_minimal()
+
+#Plot t-SNEs overlayed with marker expression values
+par(mfrow=c(ceiling(length(rownames(sce_sub))/3),3))
+lapply(rownames(sce_sub),function(x){plotTSNE(sce_sub, shape_by = "dummy", by_exprs_values = "counts", colour_by = x)})
+
+```
+
+PCA
+```{r}
+#In case this wasn't already set
+set.seed(3)
+
+#Run PCA
+sce_sub = runPCA(sce_sub, exprs_values = "counts")
+dim(reducedDim(sce_sub, "PCA"))
+plotReducedDim(subset(sce_sub,,TissueType %in% c("primary tumor","lymph node mts")), dimred = "PCA", colour_by = "TissueType")
+
+#t-SNEs
+red = as.data.table(reducedDims(subset(sce_sub,,TissueType %in% c("primary tumor","lymph node mts")))$PCA)
+tistype = subset(sce_sub,,TissueType %in% c("primary tumor","lymph node mts"))$TissueType
+shuffle = sample(ncol(subset(sce_sub,,TissueType %in% c("primary tumor","lymph node mts"))),replace = F) #shuffle points so all colors visible
+
+ggplot(red[shuffle,],aes(x=PC1, y=PC2,color = tistype[shuffle]))+
+  geom_point_rast(size = 1,alpha = 0.5)+
+  scale_color_manual(values = c("steelblue1","purple"))+
+  theme_minimal()
+
+```
+
+Heatmap of PG clusters
+```{r}
+#Marker heatmap
+sum = sumCountsAcrossCells(sce,average = T,sce$PG_clusters, exprs_values = "counts")
+p_dat = scale(t(sum))
+p_dat[p_dat > 3] =3
+p_dat[p_dat < -3] =-3
+
+#Spatial feature heatmap
+spatial = as.data.table(colData(sce)[c('Neighbors_NumberOfNeighbors_4','Neighbors_PercentTouching_4', "AreaShape_Area", "PG_clusters")])
+spatial = aggregate(spatial[,-"PG_clusters"],by = list(PG_clusters = spatial$PG_clusters),FUN = mean)
+rnames = spatial$PG_clusters
+spatial = as.matrix(spatial[,colnames(spatial)[colnames(spatial) != "PG_clusters"]])
+rownames(spatial) = rnames
+spatial = scale(spatial)
+
+#Indicate number of tumor/stromal cells per PG cluster as identified by gaussian mixture model on panCK
+nr_tum = table(colData(sce)[c('PG_clusters','GMM_class')])
+fr_tum = as.data.table(nr_tum)
+fr_tum[,fr := N/sum(N),by = "PG_clusters"]
+fr_tum = dcast.data.table(fr_tum,"PG_clusters ~ GMM_class", value.var = "fr")
+rnames = fr_tum$PG_clusters
+fr_tum=as.matrix(fr_tum[,-"PG_clusters"])
+rownames(fr_tum) = rnames
+fr_tum = fr_tum[order(as.numeric(rownames(fr_tum))),]
+
+#Plot heatmap
+h = Heatmap(p_dat, name = "markers",column_title = "markers", km = 1, col = colorRamp2(c(-2,0, 2), c('blue',"white", "red")), show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  Heatmap(spatial, name = "spatial",column_title = "spatial", km = 1, col = colorRamp2(c(-2,0, 2), c('blue',"white", "red")), show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  rowAnnotation(axis_reverse = anno_barplot(fr_tum, width = unit(10, "mm")),gp = gpar(fill = 1:2, col = 1:2))+
+  rowAnnotation(axis_reverse = anno_barplot(nr_tum, width = unit(20, "mm")),gp = gpar(fill = 1:2, col = 1:2))+
+  rowAnnotation(rn = anno_text(rownames(p_dat)))
+h
+
+#Tumor clusters
+tumor = as.numeric(as.character(unique(sce$PG_clusters)))[!as.numeric(as.character(unique(sce$PG_clusters))) %in% c(60,59,126,115,82,26,16,125,11,70,36,103,44,42,61,34)]
+tumor_bar = data.table(cluster = rownames(p_dat))
+tumor_bar$epi = 0
+tumor_bar[cluster %in% tumor,epi := 1]
+
+#50% stromal
+stroma = data.table(frac_stroma = fr_tum[,1])
+stroma$epi = 1
+stroma[frac_stroma >0.5, epi := 0]
+
+#Mark tumor clusters in heatmap
+h = Heatmap(p_dat, name = "markers",column_title = "markers", km = 1, col = colorRamp2(c(-2,0, 2), c('blue',"white", "red")), show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  Heatmap(spatial, name = "spatial",column_title = "spatial", km = 1, col = colorRamp2(c(-2,0, 2), c('blue',"white", "red")), show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  rowAnnotation(axis_reverse = anno_barplot(fr_tum, width = unit(10, "mm")),gp = gpar(fill = 1:2, col = 1:2))+
+  rowAnnotation(axis_reverse = anno_barplot(nr_tum, width = unit(20, "mm")),gp = gpar(fill = 1:2, col = 1:2))+
+  Heatmap(tumor_bar$epi, name = "cols", show_row_names = F, width = unit(10, "mm"), col = c("green","red"))+
+  Heatmap(stroma$epi, name = "cols", show_row_names = F, width = unit(10, "mm"), col = c("green","red"))+
+  rowAnnotation(rn = anno_text(rownames(p_dat)))
+h
+```
+
+

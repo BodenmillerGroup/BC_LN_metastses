@@ -1,0 +1,1738 @@
+---
+title: "Analysis_pipeline4_combined"
+author: "Jana Fischer"
+date: "14 1 2021"
+output: html_document
+---
+
+Combine tumor and non-epithelial cells. Spatial analyses. Visualization on image.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+library(data.table)
+library(SingleCellExperiment)
+library(ggplot2)
+library(ggrastr)
+library(EBImage)
+library(stringr)
+library(plyr)
+library(neighbouRhood)
+library(RColorBrewer)
+library(igraph)
+library(scater)
+library(ComplexHeatmap)
+library(circlize)
+library(entropy)
+library(viridis)
+library(patchwork)
+library(survival)
+library(broom)
+library(ggpubr)
+library(cytomapper)
+```
+
+Define spatial community extraction function
+```{r, echo = F}
+#Define function that defines spatial communtities in neighbourhood graph
+spatial_community <- function (images,
+                               relationships,
+                               centroids,
+                               cluster_column,
+                               col_vector,
+                               celltype_colors,
+                               save_graphs = F,
+                               save_location = NA){
+  comm = list()
+  count = 1
+  start.time <- Sys.time()
+  
+  #Loop through all images
+  for (i in images){
+    
+    #Get neighbour relationships and centroids of the current image
+    neighb_cur = relationships[core == i,]
+    centroids_cur = centroids[core == i,]
+    
+    #Get rid of duplicated (reciprocal) edges
+    sortE = as.matrix(neighb_cur[,c('First Object Number','Second Object Number')])
+    sortE = t(apply(sortE, 1, sort))
+    sortE = sortE[!duplicated(sortE),]
+    
+    #Prepare edges for graph
+    E = as.vector(t(sortE))
+    
+    #Construct graph
+    g = graph( edges=E, n=max(unique(centroids_cur$seq_obNr)), directed=F )
+    
+    #Run louvain community detection on graph
+    louvain = cluster_louvain(g)
+    
+    # # Alternatively, run leiden community detection on graph
+    # adjacency_matrix <- igraph::as_adjacency_matrix(g)
+    # partition_leiden <- leiden(adjacency_matrix,seed = 2, n_iterations = -1,partition_type = "ModularityVertexPartition") #la.CPMVertexPartition
+    
+    #Community assignments for each image
+    comm[[count]] = cbind(unique(centroids_cur[order(seq_obNr),c('seq_obNr','ObjectNumber','core','id',eval(cluster_column)),with = F]),membership(louvain))#,partition_leiden
+    
+    #Visualized and save neighbourhood graphs
+    if (save_graphs){
+      
+      #Colored by community
+      pdf(paste0(save_location,i,".pdf"),width = 10, height = 10)
+      print(plot(g,edge.arrow.size=.5,  vertex.size=2, vertex.label=NA,vertex.color=rep(col_vector,ceiling(max(unique(centroids_cur$seq_obNr))/length(col_vector)))[membership(louvain)],edge.color = 'red',layout = as.matrix(centroids_cur[,c('AreaShape_Center_X','AreaShape_Center_Y')])))
+      dev.off()
+      
+      #Colored by cell type
+      pdf(paste0(save_location,'celltype_',i,".pdf"),width = 10, height = 10)
+      print(plot(g,edge.arrow.size=.5,  vertex.size=2, vertex.label=NA,vertex.color=celltype_colors[as.vector(as.matrix(centroids_cur[,eval(cluster_column),with = F]))],edge.color = 'red',layout = as.matrix(centroids_cur[,c('AreaShape_Center_X','AreaShape_Center_Y')])))
+      dev.off()
+    }
+    count = count + 1
+    
+  }
+  end.time <- Sys.time()
+  runtime = end.time - start.time 
+  
+  print(runtime)
+  
+  #Return community assignments
+  comm_dat = do.call(rbind,comm)
+  names(comm_dat)[names(comm_dat) == 'V2'] = 'community_louvain'
+  return(comm_dat)
+}
+```
+
+Load data and color maps
+```{r prepare}
+#Set global seed
+set.seed(3)
+
+#Define general color map of distinguishable colors
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+col_vector = unique(col_vector)
+
+#Read in colormaps for the frequently used metadata
+cols_mol = fread("/mnt/ZTMA_21_25_26/analysis/cols_mol.csv",header = T)
+cols_grade = fread("/mnt/ZTMA_21_25_26/analysis/cols_grade.csv",header = T)
+cols_pN_4gr = fread("/mnt/ZTMA_21_25_26/analysis/cols_pN_4gr.csv",header = T)
+cols_tissue = fread("/mnt/ZTMA_21_25_26/analysis/cols_tissue",header = T)
+
+#Color maps defined in previous pipelines
+tcols = fread('/mnt/ZTMA_21_25_26/analysis/tcols.csv',header = T)
+scols = fread('/mnt/ZTMA_21_25_26/analysis/scols.csv',header = T)
+pcols = fread('/mnt/ZTMA_21_25_26/analysis/pcols.csv',header = T)
+mcols = fread('/mnt/ZTMA_21_25_26/analysis/mcols.csv',header = T)
+
+#Cluster similarities from previous pipelines
+order_tumor = fread('/mnt/ZTMA_21_25_26/analysis/order_tumor.csv',header = T)
+order_stroma = fread('/mnt/ZTMA_21_25_26/analysis/order_stroma.csv',header = T)
+
+#Read in stromal sce_s data with PG info already included
+sce_s = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_S.rds')
+
+#Read in stumor sce_t data with PG info already included
+sce_t = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_T.rds')
+
+#Read in sce containing all cells
+sce = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_PG.rds')
+
+```
+
+Combine stroma and tumor cluster info
+```{r combine tumor and stroma}
+#Add 100 to the tumor label number to distinguish tumor and stromal cluster numbering
+tclus = as.data.table(sce_t$tumor_cluster_100)
+names(tclus) = "combined_clustering"
+tclus$id = colnames(sce_t)
+tclus[,combined_clustering := as.numeric(as.character(tclus$combined_clustering)) + 100]
+
+#Get stromal cluster labels
+sclus = as.data.table(sce_s$stroma_cluster)
+names(sclus) = "combined_clustering"
+sclus$id = colnames(sce_s)
+
+#Combine tumor and stromal labels and add to sce
+cclus = rbind(tclus,sclus)
+cclus = cclus[order(match(id,colnames(sce))),]
+sce$combined_clusering = cclus$combined_clustering
+
+#Extract image single-cell ID from unique identifier
+sce$CellID = as.numeric(unlist(lapply(strsplit(colnames(sce),"_"),function(x){x[6]})))
+
+#Combine color maps of tumor and non-tumor cells
+col_comb = data.table(tcols)
+col_comb[,cluster := cluster + 100]
+#Rename for rbind
+names(col_comb)[names(col_comb) == "tumor_cols"] = "stroma_cols"
+col_comb = rbind(col_comb,scols)
+names(col_comb)[1] = "cols"
+
+#Add tumor/stroma column to sce
+sce$tumor_stroma = "stroma"
+sce$tumor_stroma[as.numeric(as.character(sce$combined_clusering)) > 100] = "tumor"
+
+#Write out ccombined color map
+fwrite(col_comb,'/mnt/ZTMA_21_25_26/analysis/cols_comb.csv',col.names = T)
+
+#Write out full single-cell experiment for publication
+saveRDS(sce, file = '/mnt/ZTMA_21_25_26/analysis/SingleCellExperiment_IMC.rds', ascii = FALSE)
+
+```
+
+Overlay tumor and stromal cluster colors onto combined tSNE
+```{r tSNE}
+#Read tSNE that was calculated in pipeline 1
+sce_sub = readRDS(file = '/mnt/ZTMA_21_25_26/analysis/SCE_sub_dimRed.rds')
+
+#Add combined clustering info
+subclus = cclus[id %in% colnames(sce_sub),]
+subclus = subclus[order(match(id,colnames(sce_sub))),]
+sce_sub$combined_clustering = subclus$combined_clustering
+
+#Prepare data
+red = as.data.table(reducedDims(sce_sub)$TSNE)
+shuffle = sample(nrow(red),replace = F)
+
+#Plot tumor and stromal cluster colors on tSNE
+ggplot(red[shuffle,],aes(x=V1, y=V2,color = sce_sub$combined_clustering[shuffle]))+
+  geom_point_rast(size = 0.2)+
+  scale_color_manual(values = col_comb[order(match(as.factor(cluster),levels(sce_sub$combined_clustering))),]$col)+
+  theme_minimal()+theme(legend.position = "none")
+
+```
+
+Plot cell features onto image (cytomapper needs > R 4.0)
+```{r cytomapper, eval =F}
+
+path = '/home/rstudio/mnt/ZTMA_21_25_26/cpout/'
+col_comb = fread('/home/rstudio//mnt/ZTMA_21_25_26/analysis/cols_comb.csv',header = T)
+
+#load masks
+all_masks <- loadImages(path, pattern = "_mask.tiff")
+all_masks <- scaleImages(all_masks, 2^16-1)
+
+#Assign core names to metadata
+mcols(all_masks)$core <- getInfoFromFileList(names(all_masks),sep = "_",1:5)
+
+cols_here = list(combined_clusering = structure(col_comb$cols,names = col_comb$cluster),tumor_stroma = structure(c("white","black"),names = c("stroma","tumor")))
+cols_here$combined_clusering[as.numeric(names(cols_here$combined_clusering)) < 100] = "black"
+#cols_here$combined_clusering["129"] = "gray"
+
+
+sce$combined_clusering = as.character(sce$combined_clusering)
+
+#Plot masks
+plotCells(mask = all_masks[mcols(all_masks)$core == "ZTMA25.1_s0_p3_r33_a33"], object = sce, 
+            cell_id = "CellID", img_id = "core", colour_by = "combined_clusering",outline_by = "tumor_stroma",colour = cols_here,legend = NULL,image_title = NULL,scale_bar = NULL,save_plot = list(filename = "/home/rstudio/mnt/R_out/img.tiff",scale = 1))
+
+
+#Load example images
+path = "/home/rstudio/mnt/ZTMA_21_25_26/tiffs/"
+
+#load tiss
+all_tiffs = loadImages(path, pattern = "ZTMA25.3_s0_p3_r233_a233_ac_full.tiff")
+channels = fread(paste0(path,'ZTMA25.1_s0_p3_r37_a37_ac_full.csv'),header = F)
+
+#Assign core names to metadata
+mcols(all_tiffs)$core <- getInfoFromFileList(names(all_tiffs),sep = "_",1:5)
+channel_names = c(rownames(sce),"Ir191_Iridium")[order(match(getInfoFromFileList(c(rownames(sce),"Ir191_Iridium"),sep = "_",1),channels$V1))]
+channelNames(all_tiffs) <- channel_names
+all_tiffs = cytomapper::normalize(all_tiffs)
+all_tiffs = cytomapper::normalize(all_tiffs,inputRange = c(0,0.3))
+
+setChannels(all_tiffs,"Tb159_p53") <- cytomapper::normalize(getChannels(all_tiffs, "Tb159_p53"), inputRange = c(0, 0.5))
+setChannels(all_tiffs, "Lu175_Keratin Epithelial") <- cytomapper::normalize(getChannels(all_tiffs, "Lu175_Keratin Epithelial"), inputRange = c(0, 0.5))
+setChannels(all_tiffs, "Dy163_GATA3") <- cytomapper::normalize(getChannels(all_tiffs, "Dy163_GATA3"), inputRange = c(0, 0.5))
+setChannels(all_tiffs, "Sm149_Vimentin") <- normalize(getChannels(all_tiffs, "Sm149_Vimentin"), inputRange = c(0, 0.5))
+setChannels(all_tiffs, "Er167_E-Cadherin / P-Cadherin") <- normalize(getChannels(all_tiffs, "Er167_E-Cadherin / P-Cadherin"), inputRange = c(0, 0.5))
+
+plotPixels(image = all_tiffs,colour_by = c("Tb159_p53","Lu175_Keratin Epithelial","Ir193_Iridium"),image_title = NULL,legend = NULL,save_plot = list(filename = "/home/rstudio/mnt/R_out/Image_Fig10000.tiff",scale = 1))
+
+
+#,save_plot = list(filename = "/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/Image_Fig1.tiff",scale = 2)
+
+plotPixels(image = all_tiffs,colour_by = c("Gd155_Bcl-2"))
+plotPixels(image = all_tiffs,colour_by = c("Dy162_CD45"))
+plotPixels(image = all_tiffs,colour_by = c("Sm149_Vimentin"))
+plotPixels(image = all_tiffs,colour_by = c("Yb172_vWF"))
+
+
+```
+
+Write out all images overlayed with cluster colors
+```{r write out images, eval = F}
+#Path to single-cell masks
+path = '/mnt/ZTMA_21_25_26/cpout/'
+all_files = list.files(path)
+
+#Loop through all images
+for (i in unique(sce$core)){
+
+  #Read mask
+  file = all_files[str_detect(all_files,i)]
+  mask = readImage(paste0(path,'/',file))
+  
+  #Rescale
+  imageData(mask) = imageData(mask)*(2^16-1)
+  
+  ##Display mask in black and white
+  #nmask = bwlabel(mask)
+  #print(display(nmask, all=TRUE))
+  
+  #Get cluster assignments and single-cell ID from sce
+  types = DataFrame(cluster = subset(sce,,core == i)$combined_clusering, CellID = subset(sce,,core == i)$CellID)
+  types$cluster = as.numeric(as.character(types$cluster))
+  
+  #Add cluster colors
+  types = merge(as.data.table(types),col_comb,by = "cluster",all.x = T)
+  
+  #Order according to cell ID
+  types = types[order(CellID),]
+
+  #Highlight cluster colors on mask
+  cl_values = mapvalues(imageData(mask),unique(sort(imageData(mask))),c("black",types$cols))
+  imgcol = Image(cl_values)
+  #print(display(imgcol, all=TRUE))
+  
+  #Write image out
+  filename = paste0('/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/Images/',i,'.tiff')
+  writeImage(imgcol, filename, quality = 100)
+}
+
+```
+
+Run neighborhood analysis
+```{r neighbourhood run,eval = F}
+#Define number of permutations
+nperm = 1000
+
+#Read single-cell relationships
+rel = fread('/mnt/ZTMA_21_25_26/cpout/Object relationships.csv',header = T)
+rel = rel[Relationship == "Neighbors",]
+rel = rel[,-c("Module","Module Number")]
+
+#Get cell cluster info
+d = as.data.table(colData(sce)[,c("core","PID","combined_clusering","CellID","ImageNumber")])
+d$id = colnames(sce)
+names(d)[names(d) == "CellID"] = "ObjectNumber"
+
+#Prepare data for neighbourhood analysis
+dat_struc = prepare_tables(d, rel, col_label = 'combined_clusering'
+                   # relationship = DEFAULTRELATIONSHIP,  # Neighbors
+                   # col_imnr = IMGNR,                    # ImageNumber
+                   # col_objnr = OBJNR,                   # ObjectNumber
+                   # col_relationship = RELATIONSHIP,     # Relationship
+                   # col_objname = OBJNAME                # ObjectName
+)
+
+#Calculate baseline statistics with the histoCAT method
+dat_baseline_histo = apply_labels(dat_struc[[1]], dat_struc[[2]]) %>%
+  aggregate_histo()
+
+#Define number of cores to use for parallelization
+require(doParallel)
+options('mc.cores' = 8)
+registerDoParallel(8)
+
+#Stop time
+start_time <- Sys.time()
+
+#Permute and calculate statistics
+dat_perm_histo = mclapply(1:nperm, function(x){
+   shuffle_labels(dat_struc[[1]]) %>%
+     apply_labels(dat_struc[[2]]) %>%
+    aggregate_histo()
+},mc.cores = 8, mc.cleanup=T
+) %>%
+  rbindlist(idcol = 'run')
+
+end_time <- Sys.time()
+print(end_time - start_time)
+
+#Calculate p-values
+dat_p_histo <- calc_p_vals(dat_baseline_histo, dat_perm_histo, n_perm = nperm)
+
+#Write out results
+fwrite(dat_p_histo,'/mnt/ZTMA_21_25_26/analysis/neighborhood_output.csv',col.names = T)
+
+```
+
+Plot neighbourhood heatmaps (normalize by number of images in which a cluster exists?)
+```{r neighbourhood plot}
+#Read in neighbourhood output
+dat_p_histo = fread('/mnt/ZTMA_21_25_26/analysis/neighborhood_output.csv',header = T)
+
+#Subset to only certain images (such as primary tumors only)
+d = unique(as.data.table(colData(sce_t)[,c("ImageNumber","TissueType","pgroups","mgroups","core")]))
+sub_imgs = d[TissueType == "primary tumor",]$ImageNumber
+
+#Prepare heatmap
+pmat_prim = dcast.data.table(dat_p_histo[group %in% sub_imgs,], 'FirstLabel ~ SecondLabel', value.var = 'sigval', fun.aggregate = base::sum, fill=0, drop=F)
+rname = pmat_prim$FirstLabel
+pmat_prim = pmat_prim[,-'FirstLabel'] %>%
+  as.matrix()
+row.names(pmat_prim) <- rname
+
+#Order according to cluster similarity
+order = c(order_stroma$V1,order_tumor$V1 + 100)
+pmat_prim = pmat_prim[order(match(rownames(pmat_prim),order)),order(match(colnames(pmat_prim),order))]
+
+#Plot heatmap
+ha = HeatmapAnnotation(CT = colnames(pmat_prim),col = list(CT = structure(col_comb$cols,names = col_comb$cluster)),show_legend=FALSE)
+neighb_prim = Heatmap(pmat_prim, name = "neighborhood",column_title = "prim", km = 1, col = colorRamp2(c(min(pmat_prim),0, max(pmat_prim)), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,cluster_columns = F,top_annotation = ha)+
+        Heatmap(rownames(pmat_prim), name = "CT", show_row_names = T, width = unit(10, "mm"), col = structure(col_comb$cols,names = col_comb$cluster),show_heatmap_legend = F)+
+        rowAnnotation(rn = anno_text(rownames(pmat_prim)))
+
+
+#LN mets only
+sub_imgs = d[TissueType == "lymph node mts",]$ImageNumber
+pmat = dcast.data.table(dat_p_histo[group %in% sub_imgs,], 'FirstLabel ~ SecondLabel', value.var = 'sigval', fun.aggregate = base::sum, fill=0)
+rname = pmat$FirstLabel
+pmat = as.matrix(pmat[,-'FirstLabel'])
+row.names(pmat) <- rname
+
+#Add in zeros for clusters that don't exist in met
+missing = rownames(pmat_prim)[!rownames(pmat_prim) %in% rownames(pmat)]
+mat = matrix(rep(0,nrow(pmat)))
+colnames(mat) = missing
+pmat = cbind(pmat,mat)
+mat = t(matrix(rep(0,ncol(pmat))))
+rownames(mat) = missing
+pmat = rbind(pmat,mat)
+
+#Plot heatmap
+pmat = pmat[order(match(rownames(pmat),order)),order(match(colnames(pmat),order))]
+ha = HeatmapAnnotation(CT = colnames(pmat),col = list(CT = structure(col_comb$cols,names = col_comb$cluster)),show_legend=FALSE)
+neighb_met = Heatmap(pmat, name = "neighborhood",column_title = "met", km = 1, col = colorRamp2(c(min(pmat),0, max(pmat)), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,cluster_columns = F,top_annotation = ha)+
+        Heatmap(rownames(pmat), name = "CT", show_row_names = T, width = unit(10, "mm"), col = structure(col_comb$cols,names = col_comb$cluster),show_heatmap_legend = F)+
+        rowAnnotation(rn = anno_text(rownames(pmat)))
+
+#Side by side
+neighb_prim + neighb_met
+
+```
+
+Plot flat neighbourhood heatmap (neighbourhood on tumor cells only)
+```{r neighbourhood plot flat}
+#Load data
+dat_p_histo = fread('/mnt/ZTMA_21_25_26/analysis/neighborhood_output_tumor100.csv',header = T)
+
+#One row per image
+dat_p_table <- as.data.table(dat_p_histo %>%
+                               mutate(FirstLabel = factor(FirstLabel),
+                                      SecondLabel = factor(SecondLabel),
+                                      group = factor(group)) %>%
+                               arrange(FirstLabel, SecondLabel, group))
+
+pmat = dcast(dat_p_table, 'FirstLabel+SecondLabel~group', value.var = 'sigval',  fill=0, drop=F)
+pmat$labels = paste0(pmat$FirstLabel,'_',pmat$SecondLabel)
+pmat = pmat[,c('labels',colnames(pmat)[3:(ncol(pmat)-1)]),with = F]
+rnames = pmat$labels
+
+#Prepare matrix for heatmap
+pmat = as.matrix(pmat[,2:ncol(pmat)])
+rownames(pmat) = rnames
+pmat = t(pmat)
+
+#Add data for colorbars
+d = unique(as.data.table(colData(sce_t)[,c("ImageNumber","TissueType","Grade","pN_4gr","Mol_Signature")]))
+d = d[ImageNumber %in% as.numeric(rownames(pmat)), ]
+d = d[order(match(ImageNumber,as.numeric(rownames(pmat)))),]
+
+#Plot heatmap
+h = Heatmap(pmat, name = "Per Image",column_title = "met", km = 1, col = colorRamp2(c(-1,0, 1), c('blue',"white", "red")),
+              show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  Heatmap(d$Mol_Signature, name = "Clinical Types", show_row_names = F, width = unit(10, "mm"), col = structure(cols_mol$col, names = cols_mol$Mol_Signature))+
+  Heatmap(d$Grade, name = "Grade", show_row_names = F, width = unit(10, "mm"), col = structure(cols_grade$col, names = cols_grade$Grade))+
+  Heatmap(d$pN_4gr, name = "pN_4gr", show_row_names = F, width = unit(10, "mm"), col = structure(cols_pN_4gr$col, names = cols_pN_4gr$pN_4gr))+
+  Heatmap(d$TissueType, name = "TissueType", show_row_names = F, width = unit(10, "mm"), col = structure(cols_tissue$col,names = unique(d$TissueType)))
+h
+
+```
+
+Run neighborhood analysis with all tumor cells labelled 100
+```{r neighbourhood run,eval = F}
+#Define number of permutations
+nperm = 1000
+
+#Read single-cell relationships
+rel = fread('/mnt/ZTMA_21_25_26/cpout/Object relationships.csv',header = T)
+rel = rel[Relationship == "Neighbors",]
+rel = rel[,-c("Module","Module Number")]
+
+#Get cell cluster info
+d = as.data.table(colData(sce)[,c("core","PID","combined_clusering","CellID","ImageNumber")])
+d$id = colnames(sce)
+names(d)[names(d) == "CellID"] = "ObjectNumber"
+d$clustering_tumor_same = as.numeric(as.character(d$combined_clusering))
+d[as.numeric(as.character(combined_clusering)) > 100, clustering_tumor_same := 100]
+ 
+#Prepare data for neighbourhood analysis
+dat_struc = prepare_tables(d, rel, col_label = 'clustering_tumor_same'
+                   # relationship = DEFAULTRELATIONSHIP,  # Neighbors
+                   # col_imnr = IMGNR,                    # ImageNumber
+                   # col_objnr = OBJNR,                   # ObjectNumber
+                   # col_relationship = RELATIONSHIP,     # Relationship
+                   # col_objname = OBJNAME                # ObjectName
+)
+
+#Calculate baseline statistics with the histoCAT method
+dat_baseline_histo = apply_labels(dat_struc[[1]], dat_struc[[2]]) %>%
+  aggregate_histo()
+
+#Calculate baseline stats with classic method
+dat_temp = apply_labels(dat_struc[[1]], dat_struc[[2]])
+dat_temp$ct = 1 #Only necessary because of weird version doesn't assign in apply labels
+dat_baseline_classic =  aggregate_classic(dat_temp)
+
+
+#Define number of cores to use for parallelization
+require(doParallel)
+options('mc.cores' = 1)
+registerDoParallel(1)
+
+#Stop time
+start_time <- Sys.time()
+
+#Permute and calculate statistics histo
+dat_perm_histo = mclapply(1:nperm, function(x){
+   shuffle_labels(dat_struc[[1]]) %>%
+     apply_labels(dat_struc[[2]]) %>%
+    aggregate_histo()
+},mc.cores = 1, mc.cleanup=T
+) %>%
+  rbindlist(idcol = 'run')
+
+end_time <- Sys.time()
+print(end_time - start_time)
+
+#Calculate p-values histo
+dat_p_histo <- calc_p_vals(dat_baseline_histo, dat_perm_histo, n_perm = nperm)
+
+#Write out results
+fwrite(dat_p_histo,'/mnt/ZTMA_21_25_26/analysis/neighborhood_output_tumor100_histo.csv',col.names = T)
+
+
+#Permute and calculate statistics for classic
+dat_perm_classic = mclapply(1:nperm, function(x){
+   d = shuffle_labels(dat_struc[[1]]) %>%
+     apply_labels(dat_struc[[2]])
+   d$ct = 1
+    aggregate_classic(d)
+},mc.cores = 1, mc.cleanup=T
+) %>%
+  rbindlist(idcol = 'run')
+
+
+#Calculate p-values classic
+dat_p_classic <- calc_p_vals(dat_baseline_classic, dat_perm_classic, n_perm = nperm)
+
+#Write out results
+fwrite(dat_p_hclassic,'/mnt/ZTMA_21_25_26/analysis/neighborhood_output_tumor100_classic.csv',col.names = T)
+
+```
+
+Extract spatial communtities from neighbourhood graphs
+```{r extract communities, eval = F}
+#Load and prepare neighbour relationship data
+rel = fread('/mnt/ZTMA_21_25_26/cpout/Object relationships.csv',header = T)
+rel = rel[Relationship == "Neighbors",]
+rel = rel[,-c("Module","Module Number","Relationship","First Object Name","Second Object Name","Second Image Number")]
+names(rel)[names(rel) == "First Image Number"] = "ImageNumber"
+
+#Load image metadata
+image_meta = fread('/mnt/ZTMA_21_25_26/cpout/Image.csv',header = T,stringsAsFactors = F)
+cols = c('FileName_CellImage','FileName_FullStack','Width_FullStack','Height_FullStack','ImageNumber',"Metadata_Description")
+image_meta_short = subset(image_meta, , cols)
+image_meta_short[,core := sub("_ac_full.tif.*","",.BY),by = "FileName_FullStack"]
+image_meta_short = unique(image_meta_short[,c("ImageNumber","core")])
+rel = merge(rel,image_meta_short,by = "ImageNumber")
+
+
+#Extract tumor communities (only tumor cells in graph)
+
+#Get centroids and tumor clusters
+centroids = as.data.table(colData(sce_t)[,c('core','AreaShape_Center_X','AreaShape_Center_Y',"tumor_cluster_100")])
+centroids$id = colnames(sce_t)
+centroids$ObjectNumber = as.numeric(unlist(lapply(strsplit(centroids$id,"_"),function(x){x[6]})))
+
+#Create consecutive object numbers (in case not already the case)
+centroids[,seq_obNr := 1:.N,by = 'core']
+
+#Apply new object numbers to relationships table
+names(rel)[names(rel) == "Second Object Number"] = 'ObjectNumber'
+rel_tumor = merge(rel,centroids[,c('core','ObjectNumber','seq_obNr')],by = c('core','ObjectNumber'))
+rel_tumor$`Second Object Number` = rel_tumor$seq_obNr
+rel_tumor$seq_obNr = NULL
+rel_tumor$ObjectNumber = NULL
+
+names(rel_tumor)[names(rel_tumor) == "First Object Number"] = 'ObjectNumber'
+rel_tumor = merge(rel_tumor,centroids[,c('core','ObjectNumber','seq_obNr')],by = c('core','ObjectNumber'))
+rel_tumor$`First Object Number` = rel_tumor$seq_obNr
+rel_tumor$seq_obNr = NULL
+rel_tumor$ObjectNumber = NULL
+
+#Run community detection on tumor cells
+comm_tum = spatial_community(unique(centroids$core),rel_tumor,centroids,"tumor_cluster_100",col_vector,tcols$tumor_cols,save_graphs = F,save_location = '/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/Graphs_tumor/')
+
+#Save tumor communities
+fwrite(comm_tum,'/mnt/ZTMA_21_25_26/analysis/tumor_communities.csv',col.names = T)
+
+
+#Extract microenvironment communities (using all cells; tumor and stroma)
+
+#Get centroids
+centroids = as.data.table(colData(sce)[,c('core','AreaShape_Center_X','AreaShape_Center_Y',"combined_clusering")])
+centroids$id = colnames(sce)
+centroids$ObjectNumber = as.numeric(centroids$CellID)
+
+#Create consecutive object numbers
+centroids[,seq_obNr := 1:.N,by = 'core']
+
+#Apply new object numbers to relationships table
+names(rel)[names(rel) == "Second Object Number"] = 'ObjectNumber'
+rel_tumor = merge(rel,centroids[,c('core','ObjectNumber','seq_obNr')],by = c('core','ObjectNumber'))
+rel_tumor$`Second Object Number` = rel_tumor$seq_obNr
+rel_tumor$seq_obNr = NULL
+rel_tumor$ObjectNumber = NULL
+
+names(rel_tumor)[names(rel_tumor) == "First Object Number"] = 'ObjectNumber'
+rel_tumor = merge(rel_tumor,centroids[,c('core','ObjectNumber','seq_obNr')],by = c('core','ObjectNumber'))
+rel_tumor$`First Object Number` = rel_tumor$seq_obNr
+rel_tumor$seq_obNr = NULL
+rel_tumor$ObjectNumber = NULL
+
+#Set all tumor cells to same cluster id (treat them like they were all just in one cluster)
+centroids$combined_clusering = as.numeric(as.character(centroids$combined_clusering))
+centroids$combined_clusering[centroids$combined_clusering > 100] = max(centroids$combined_clusering[centroids$combined_clusering < 100])+1
+
+#Run community detection for microenvironment communities
+comm_micro = spatial_community(unique(centroids$core),rel_tumor,centroids,"combined_clusering",col_vector,c(col_comb[60:90]$cols,"black"),save_graphs = F,save_location = '/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/Graphs_micro/')
+
+#Write out
+fwrite(comm_micro,'/mnt/ZTMA_21_25_26/analysis/microenv_communities.csv',col.names = T)
+
+```
+
+Read tumor communities and prepare for analysis
+```{r tumor communities}
+comm_tum = fread('/mnt/ZTMA_21_25_26/analysis/tumor_communities.csv',header = T)
+
+#Assign unique community id
+comm_tum[,comm_id := paste0(core,"_",community_louvain)]
+
+#Merge with metadata
+add = as.data.table(colData(sce_t)[,c("pgroups","TissueType","edge_bool")])
+add$id = colnames(sce_t)
+comms = merge(comm_tum,add,by = "id")
+comms = comms[TissueType %in% c("primary tumor","lymph node mts")]
+
+#Only consider communities with at least 10 cells
+comms[,tot_cells := .N, by = c("comm_id")]
+comms = comms[tot_cells >= 10,]
+
+#Calculate number of cells of each cluster per community
+comms[,ncells := .N, by = c("comm_id","tumor_cluster_100")]
+
+#Calculate number of edge cells per community (edge of the core)
+comms[,edge_cells := sum(edge_bool), by = "comm_id"]
+
+#Convert into wide format with:
+comms = unique(comms[,c("core", "comm_id","tumor_cluster_100","ncells","tot_cells","pgroups","edge_cells")])
+
+#Absolute number of cluster cells per community
+comm_wide = dcast.data.table(comms,"core + comm_id + tot_cells + edge_cells ~ tumor_cluster_100",value.var = "ncells",fill = 0)
+
+#Normalize by community size -> fraction of cells
+comm_wide_size = cbind(comm_wide[,c("core","comm_id","tot_cells","edge_cells")],comm_wide[,-c("core","comm_id","tot_cells","edge_cells")]/comm_wide$tot_cells)
+
+#01-normalize absolute cluster numbers  per community
+comm_wide_norm = cbind( comm_wide[,c("core","comm_id","tot_cells","edge_cells")],apply(comm_wide[,-c("core","comm_id","tot_cells","edge_cells")],2, function(x){(x-min(x))/(max(x)-min(x))}))
+
+```
+
+Cluster tumor communities into community types
+```{r community types,eval = F}
+#Make community sce
+comm_mat = as.matrix(comm_wide_norm[,-c("core","comm_id","tot_cells","edge_cells")])
+rownames(comm_mat) = comm_wide_norm$comm_id
+comm_mat = t(comm_mat)
+sce_t_comm <- SingleCellExperiment(assays = list(counts = comm_mat ))
+df = DataFrame(comm_wide_norm[,c("core","tot_cells","edge_cells")])
+rownames(df) = colnames(sce_t_comm)
+colData(sce_t_comm) = df
+
+#Add metadata
+meta = unique(as.data.table(colData(sce_t)[,c("core",'Mol_Signature',"Grade","TissueType","pN_4gr","PID","pgroups")]))
+meta = merge(as.data.table(colData(sce_t_comm)),meta,by = "core",all.x = T)
+meta = DataFrame(meta)
+rownames(meta) = colnames(sce_t_comm)
+colData(sce_t_comm) = DataFrame(meta)
+
+#Run PhenoGraph
+rand_seed = 3
+rpheno_out = cytofkit::Rphenograph(t(counts(sce_t_comm)), k = 30, seed = rand_seed,approx = T)
+sce_t_comm$comm_cluster = as.character(igraph::membership(rpheno_out))
+  
+#Run umap
+sce_t_comm = runUMAP(sce_t_comm, exprs_values = "counts", n_neighbors = 25, min_dist = 0.5, external_neighbors=TRUE, BPPARAM = MulticoreParam())
+sce_t_comm$dummy = 1
+
+#Get (abs) majority celltype color for each comm_cluster
+d = as.data.table(colData(sce_t_comm)[,c("comm_cluster")])
+names(d) = "comm_cluster"
+d$comm_id = colnames(sce_t_comm)
+d = merge(comm_wide,d,by = "comm_id")
+d = aggregate(d[,-c("comm_cluster","core","comm_id","edge_cells")], by=list(d$comm_cluster),
+  FUN=mean, na.rm=TRUE)
+d$max_type = apply(d[,colnames(d)[!colnames(d) %in% c("Group.1","tot_cells")]],1,function(x){colnames(d)[!colnames(d) %in% c("Group.1","tot_cells")][x == max(x)]})
+d_cols = unique(d[,c("Group.1","max_type")])
+colnames(d_cols)[2] = "cluster"
+d_cols = merge(d_cols,tcols,by = "cluster")
+d_cols = d_cols[order(d_cols$Group.1),]
+
+#fwrite(d_cols,"/mnt/ZTMA_21_25_26/analysis/cols_tumor_comm.csv",col.names = T)
+#saveRDS(sce_t_comm,'/mnt/ZTMA_21_25_26/analysis/SCE_Community_tumor.rds')
+
+```
+
+Visualize tumor community types
+```{r plot tumor communities}
+#Read community sce
+sce_t_comm = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_Community_tumor.rds')
+
+#Get (abs) majority celltype color for each comm_cluster
+d = as.data.table(colData(sce_t_comm)[,c("comm_cluster")])
+names(d) = "comm_cluster"
+d$comm_id = colnames(sce_t_comm)
+d = merge(comm_wide,d,by = "comm_id")
+d = aggregate(d[,-c("comm_cluster","core","comm_id","edge_cells")], by=list(d$comm_cluster),
+  FUN=mean, na.rm=TRUE)
+d$max_type = apply(d[,colnames(d)[!colnames(d) %in% c("Group.1","tot_cells")]],1,function(x){colnames(d)[!colnames(d) %in% c("Group.1","tot_cells")][x == max(x)]})
+d_cols = unique(d[,c("Group.1","max_type")])
+colnames(d_cols)[2] = "cluster"
+d_cols = merge(d_cols,tcols,by = "cluster")
+d_cols = d_cols[order(d_cols$Group.1),]
+  
+#Plot community tSNEs overlayed with:
+#Color of majority cluster in community type
+print(plotReducedDim(sce_t_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "comm_cluster") + scale_color_manual(values = d_cols$tumor_cols))
+
+#Tissuetype
+print(plotReducedDim(sce_t_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "TissueType"))
+
+#Number of cells per community
+print(plotReducedDim(sce_t_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "tot_cells"))
+
+#Nodal status
+print(plotReducedDim(sce_t_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "pN_4gr"))
+
+#Molecular subtype
+print(plotReducedDim(sce_t_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "Mol_Signature"))
+
+#Grade
+print(plotReducedDim(sce_t_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "Grade"))
+
+#Number of edge cells
+print(plotReducedDim(sce_t_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "edge_cells"))
+
+
+#Sample heatmap (rows) clustered by community type content
+hm_dat = as.data.table(colData(sce_t_comm)[,c("PID","pgroups","comm_cluster","Grade","Mol_Signature","pN_4gr","TissueType")])
+hm_dat[,both := .N, by = c('comm_cluster','PID','TissueType')]
+hm_dat[,frac_patient := both/.N, by = c('PID','TissueType')]
+hm_dat = unique(hm_dat)
+hm_dat = dcast.data.table(hm_dat,"TissueType + PID + pgroups + Grade + Mol_Signature + pN_4gr ~ comm_cluster",value.var = "frac_patient",fill = 0)
+
+mgroups = unique(as.data.table(colData(sce_t)[,c("PID","mgroups")]))
+hm_dat = merge(hm_dat,mgroups,by = "PID",all.x = T)
+
+hm_dat[TissueType != "lymph node mts",mgroups := NA]
+hm_dat[TissueType != "primary tumor",pgroups := NA]
+
+rownames(d) = d$Group.1
+d = d[colnames(hm_dat)[!colnames(hm_dat) %in% c('PID','pgroups','mgroups','Grade','Mol_Signature','pN_4gr','TissueType')],]
+
+#Plot heatmap
+column_ha = HeatmapAnnotation(nr_cells = anno_barplot(d[,colnames(d)[!colnames(d) %in% c('max_type',"Group.1","tot_cells")]],gp = gpar(fill = tcols$tumor_cols, col = tcols$tumor_cols),height = unit(40, "mm")))
+h = Heatmap(as.matrix(hm_dat[,-c('PID','pgroups','mgroups','Grade','Mol_Signature','pN_4gr','TissueType')]), name = "Clustergram", km = 1, col = colorRamp2(c(0, 1), c("white", "red")),show_row_names = F, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2", top_annotation = column_ha)+
+  Heatmap(hm_dat$pgroups, name = "pgroups", show_row_names = F, width = unit(10, "mm"), col = structure(pcols$col, names = pcols$pgroups))+
+  Heatmap(hm_dat$mgroups, name = "mgroups", show_row_names = F, width = unit(10, "mm"), col = structure(mcols$col, names = mcols$pgroups))+
+  Heatmap(hm_dat$Grade, name = "Grade", show_row_names = F, width = unit(10, "mm"), col = structure(cols_grade$col, names = cols_grade$Grade))+
+  Heatmap(hm_dat$Mol_Signature, name = "Mol_Signature", show_row_names = F, width = unit(10, "mm"), col = structure(cols_mol$col, names = cols_mol$Mol_Signature))+
+  Heatmap(hm_dat$pN_4gr, name = "pN_4gr", show_row_names = F, width = unit(10, "mm"), col = structure(cols_pN_4gr$col, names = cols_pN_4gr$pN_4gr))
+h
+
+
+#Celltype correlations within communities by fraction
+cor_CT_comm = cor(comm_wide_size[,-c("core","comm_id","tot_cells","edge_cells")])
+
+#clustered heatmap
+ha_mix = HeatmapAnnotation(tumor = colnames(cor_CT_comm),
+    col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+hm_corr_CT_comm = Heatmap(cor_CT_comm, name = "correlation of CTs within tumor comm",column_title = "correlation of CTs within tumor comm", km = 1, col = colorRamp2(c(-1,0, 1), c('blue',"white", "red")),show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_mix)+
+  rowAnnotation(rn = anno_text(rownames(cor_CT_comm)))
+hm_corr_CT_comm
+
+```
+
+Check for healthy tissue communities
+```{r healthy communities}
+#Read in cophenetic distances from heatmap in pipeline 2 just because clusters are in order of heatmap and it is easier to get HR pos ones
+dend_dist = read.csv("/mnt/ZTMA_21_25_26/analysis/cophenetic_dist.csv")
+
+#Get communities containing basal and HR+HER2- cells
+HRpoHER2neg = make.names(c(dend_dist$X[c(4:16)],23,34))
+basal = make.names(c(33,42,6,43,10))
+
+#Subset to only primary tumors
+prim_cores = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","core")]))
+comms_prim = comm_wide_size[core %in% prim_cores$core,]
+
+#Sum up basal/HRpos cluster fractions
+colnames(comms_prim) = make.names(colnames(comms_prim))
+comms_prim[,basal_cells := rowSums(.SD),.SDcols = basal]
+comms_prim[,HR_cells := rowSums(.SD),.SDcols = HRpoHER2neg]
+comms_prim[,both_cells := basal_cells + HR_cells]
+
+#Communities where the combination makes up the majority of cells
+comms_prim = comms_prim[both_cells > 0.5,]
+
+#Communities with both
+both = comms_prim[basal_cells > 0.1 & HR_cells > 0.1,]
+both[,ncomms := .N,by = core]
+both[,ncells := sum(tot_cells),by = core]
+
+#Filter images by number of communities with both
+ggplot(both, aes(x = both$ncomms))+geom_density()
+unique(both[ncomms > 5,]$core)
+
+#Filter images by number of cells in communities with both --> use this one
+ggplot(both, aes(x = both$ncells))+geom_density()
+sel = unique(both[ncells > 400,]$core)
+
+#Calculate fractions of tumor cells made up by these communities
+d = as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("core","PID")])
+d[,tumor_cells := .N,by = "core"]
+d = unique(d[,c("core","tumor_cells")])
+
+both = merge(both,d,by = "core",all.x = T)
+both[,fraccells := ncells/tumor_cells]
+
+#Filter images by fraction of cells in communities with both
+ggplot(both, aes(x = both$fraccells))+geom_density()
+unique(both[fraccells > 0.4,]$core)
+
+
+#Check that myoepithalial cells are not predominant in selected cores
+#Get most abundant primary tumor cluster
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=20,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('tumor_cluster_100','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Extract for each sample the cluster that makes up the largest proportion of cells
+m = apply(primary[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(primary[,-"PID"])[x]})
+
+#Exclude samples with shared largest proportion
+PID_excl = primary$PID[unlist(lapply(n,length)) > 1]
+n = n[!unlist(lapply(n,length)) > 1]
+
+#Put most abundant primary tumor cluster for each patient into a table
+maj_prim = as.data.table(unlist(n))
+names(maj_prim) = "cluster_prim"
+maj_prim$PID = primary$PID[!primary$PID %in% PID_excl]
+
+#Add core names
+cores = unique(as.data.table(colData(sce_t)[,c("PID","core","TissueType")]))
+maj_prim = merge(maj_prim,cores,by = "PID")
+
+#Check predominant phenotypes in selection of potential healthy ducts
+PIDs = cores[core %in% sel,]$PID
+selection = maj_prim[PID %in% PIDs,]
+b = selection[cluster_prim %in% c(33,42,6,43,10),]
+
+
+```
+
+Check for tumor communities containing cluster 29 cells
+```{r}
+#Subset to only primary tumors
+prim_cores = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","core")]))
+comms_prim = comm_wide_size[core %in% prim_cores$core,]
+
+#only mets
+met_cores = unique(as.data.table(colData(subset(sce_t,,TissueType == "lymph node mts"))[,c("PID","core")]))
+comms_met = comm_wide_size[core %in% met_cores$core,]
+
+ggplot(comms_prim, aes(x = `29`))+geom_density()
+ggplot(comms_met, aes(x = `29`))+geom_density()
+
+#Primary communities where 29 makes up X% of cells
+comms_prim_limited = comms_prim[`29` > 0.2,]
+uncores = unique(comms_prim_limited$core)
+
+#What other cell types are present
+d = as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("core","PID","tumor_cluster_100")])
+d = d[core %in% uncores,]
+d[,ncells := .N,by = c("core","tumor_cluster_100")]
+d[,frac := ncells/.N,by = "core"]
+d = unique(d[,c("core","tumor_cluster_100","ncells","frac")])
+
+#Rank according to number of 29 cells
+ranking = d[tumor_cluster_100 == "29",]
+d[,core := factor(core,levels = ranking[order(frac),]$core)]
+
+#Numbers of different tumor cells in these images
+ggplot(d, aes(x = core, y = ncells, fill  = tumor_cluster_100)) + 
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = tcols[cluster %in% unique(d$tumor_cluster_100),]$tumor_cols)
+
+#Check cell type correlations within communities in those images
+corr = cor(comms_prim_limited[,-c("core","comm_id","tot_cells","edge_cells")])
+corr[is.na(corr)] = 0
+
+#clustered heatmap
+ha_mix = HeatmapAnnotation(tumor = colnames(corr),
+    col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+hm_corr_CT_comm = Heatmap(corr, name = "correlation of CTs within tumor comm",column_title = "correlation of CTs within tumor comm", km = 1, col = colorRamp2(c(-1,0, 1), c('blue',"white", "red")),show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_mix)+
+  rowAnnotation(rn = anno_text(rownames(corr)))
+hm_corr_CT_comm
+
+
+#Met communities where 29 makes up X% of cells
+comms_met_limited = comms_met[`29` > 0.2,]
+uncores = unique(comms_met_limited$core)
+
+#What other cell types are present
+d = as.data.table(colData(subset(sce_t,,TissueType == "lymph node mts"))[,c("core","PID","tumor_cluster_100")])
+d = d[core %in% uncores,]
+d[,ncells := .N,by = c("core","tumor_cluster_100")]
+d[,frac := ncells/.N,by = "core"]
+d = unique(d[,c("core","tumor_cluster_100","ncells","frac")])
+
+#Rank according to number of 29 cells
+ranking = d[tumor_cluster_100 == "29",]
+d[,core := factor(core,levels = ranking[order(frac),]$core)]
+
+ggplot(d, aes(x = core, y = ncells, fill  = tumor_cluster_100)) + 
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = tcols[cluster %in% unique(d$tumor_cluster_100),]$tumor_cols)
+
+#Check cell type correlations within communities in those images
+corr = cor(comms_met_limited[,-c("core","comm_id","tot_cells","edge_cells")])
+corr[is.na(corr)] = 0
+
+#clustered heatmap
+ha_mix = HeatmapAnnotation(tumor = colnames(corr),
+    col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+hm_corr_CT_comm = Heatmap(corr, name = "correlation of CTs within tumor comm",column_title = "correlation of CTs within tumor comm", km = 1, col = colorRamp2(c(-1,0, 1), c('blue',"white", "red")),show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_mix)+
+  rowAnnotation(rn = anno_text(rownames(corr)))
+hm_corr_CT_comm
+
+```
+
+Local heterogneiety: Compare separated tumor departments versus mixed! -> heterogeneity and survival
+```{r local heterogeneity}
+#Calculate shannon index for every community
+counts = as.matrix(comm_wide[,-c("core","comm_id","tot_cells","edge_cells")])
+res = as.data.table(comm_wide$comm_id)
+names(res) = "comm_id"
+res$shannon = apply(counts,1,entropy.ChaoShen)
+
+#Add metadata
+grp = as.data.table(colData(sce_t_comm)[,c("PID","pgroups","comm_cluster","TissueType")])
+grp$comm_id = colnames(sce_t_comm)
+res = merge(res,grp,by = "comm_id")
+
+#Order according to heatmap
+res$comm_cluster = factor(res$comm_cluster,levels = colnames(hm_dat[,-c('PID','pgroups','Grade','Mol_Signature','pN_4gr','TissueType')])[column_order(h)$Clustergram])
+
+#Shannon entropy per community type boxplot ordered according to heatmap
+ggplot(res,aes(x = comm_cluster,y = shannon)) + geom_boxplot()
+
+#Order according to increasing mean shannon
+res[,mean_shannon := mean(shannon),by = "comm_cluster"]
+res = res[order(mean_shannon),]
+res$comm_cluster = factor(res$comm_cluster, unique(as.character(res$comm_cluster)))
+ggplot(res,aes(x = comm_cluster,y = shannon)) + geom_boxplot()
+
+#Order community type absolute number bars according to increasing shannon
+hm_dat = hm_dat[,c(unique(as.character(res$comm_cluster)),'PID','pgroups','mgroups','Grade','Mol_Signature','pN_4gr','TissueType'),with = F]
+d = d[c(unique(as.character(res$comm_cluster))),]
+column_ha = HeatmapAnnotation(nr_cells = anno_barplot(d[,colnames(d)[!colnames(d) %in% c('max_type',"Group.1","tot_cells")]],gp = gpar(fill = tcols$tumor_cols, col = tcols$tumor_cols),height = unit(40, "mm")))
+h = Heatmap(as.matrix(hm_dat[,-c('PID','pgroups','mgroups','Grade','Mol_Signature','pN_4gr','TissueType')]), name = "Clustergram", km = 1, col = colorRamp2(c(0, 1), c("white", "red")),show_row_names = F, show_column_names =  T, clustering_method_rows = "ward.D2",cluster_columns = F, top_annotation = column_ha)+
+  Heatmap(hm_dat$pgroups, name = "pgroups", show_row_names = F, width = unit(10, "mm"), col = structure(pcols$col, names = pcols$pgroups))+
+  Heatmap(hm_dat$mgroups, name = "mgroups", show_row_names = F, width = unit(10, "mm"), col = structure(mcols$col, names = mcols$pgroups))+
+  Heatmap(hm_dat$Grade, name = "Grade", show_row_names = F, width = unit(10, "mm"), col = structure(cols_grade$col, names = cols_grade$Grade))+
+  Heatmap(hm_dat$Mol_Signature, name = "Mol_Signature", show_row_names = F, width = unit(10, "mm"), col = structure(cols_mol$col, names = cols_mol$Mol_Signature))+
+  Heatmap(hm_dat$pN_4gr, name = "pN_4gr", show_row_names = F, width = unit(10, "mm"), col = structure(cols_pN_4gr$col, names = cols_pN_4gr$pN_4gr))
+h
+
+
+#Correlate mixing (local heterogeneity) with overall heterogeneity from pipeline 2
+res[,mixing := mean(shannon),by = c("PID","TissueType")]
+
+#Check in LN mets
+met_mix = res[TissueType == "lymph node mts",]
+met_mix = unique(met_mix[,c("PID","mixing")])
+
+#Calculate cluster numbers in LN mets and overall heterogeneity (as in pipeline 2)
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=100,]
+met = unique(met[,c("PID","tumor_cluster_100","ncells")])
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",fill =0)
+met$entropy = apply(as.matrix(met[,-"PID"]),1,entropy.ChaoShen)
+
+#Combine
+het_mix = merge(met,met_mix,by = "PID")
+cor_het = cor(het_mix[,c("mixing","entropy")])
+
+#Scatter plot
+ggplot(het_mix,aes(x = mixing, y = entropy)) + geom_point() + geom_smooth(method = lm)
+
+#Get survival info and metadata
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Grade","Mol_Signature","pN_4gr")]))
+add$Mol_Signature[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$Mol_Signature[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add = unique(add)
+surv_dat = merge(surv_dat,add,by = "PID",all.x = T)
+met_mix = merge(met_mix,surv_dat,by = "PID")
+
+#Set refrerence levels and clean
+met_mix[pN_4gr == "pN0",pN_4gr := "#NULL!"]#Only in mets
+met_mix[is.na(pN_4gr),pN_4gr := "#NULL!"]
+met_mix[pN_4gr == "7",pN_4gr := "#NULL!"]
+met_mix[,pN_4gr := factor(pN_4gr,levels = c("pN1","pN2","pN3","#NULL!"))]
+
+met_mix[is.na(Grade),Grade := "#NULL!"]
+met_mix[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+met_mix[Grade == "4",Grade := "#NULL!"]
+met_mix[,Grade := factor(Grade,levels = c("G3","G2","G1","#NULL!"))]
+met_mix[,Mol_Signature := factor(Mol_Signature,levels = c("Luminal B (HER2-)","Luminal A","Luminal B (HER2+)","HER2","Triple negative","#NULL!"))]
+
+#Coxph on mixing and clinical classifications
+res.cox2 <- coxph(Surv(met_mix$OS, met_mix$censoring) ~ mixing + pN_4gr + Grade + Mol_Signature, data =  met_mix)
+summary(res.cox2)
+
+#Extract model output
+CI = confint(res.cox2)
+dt <- data.table(x = names(res.cox2$coefficients),
+                 HR = exp(res.cox2$coefficients),
+                 L = exp(CI[,1]),
+                 U = exp(CI[,2]))
+
+#Sort by increasing hazard ratio
+dt = dt[order(HR),]
+
+#Association is significant if the CI of the hazard ratio does not include 1
+dt$sign = "non significant"
+dt$sign[dt$L < 1 & dt$U < 1] = "significant"
+dt$sign[dt$L > 1 & dt$U > 1] = "significant"
+dt$x = factor(dt$x,levels = dt$x)
+
+#Visualize hazard ratios
+ggplot(dt, aes(x = x, y = HR, color = sign)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = U, ymin = L))+
+scale_color_manual(values = c('lightblue','red'))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')
+
+
+#Check for primary tissue mixing and survival association
+prim_mix = res[TissueType == "primary tumor",]
+prim_mix = unique(met_mix[,c("PID","mixing")])
+
+#Get data from sce_t
+surv_dat = unique(as.data.table(colData(sce_s)[,c('TissueType','OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[TissueType == "primary tumor",]
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+prim_mix = merge(prim_mix,surv_dat,by = "PID")
+
+#Coxph on primary tumor tissue mixing
+res.cox2 <- coxph(Surv(OS, censoring) ~ mixing, data =  prim_mix)
+summary(res.cox2)
+
+
+#Check for matched samples if mixedness is higher in met than in primary
+both = unique(res[,c("PID","mixing","TissueType")])
+both[mixing >= quantile(mixing,0.75),upper := "upper",by = "TissueType"]
+both[,test := .N,by = "PID"]
+both = both[test == 2,]
+pids = both[TissueType == "lymph node mts" & upper == "upper",]$PID
+both = both[PID %in% pids,]
+
+#Boxplot across all
+ggplot(both,aes(x = TissueType, y = mixing))+
+  geom_boxplot()
+
+#Paired box plot
+ggpaired(both, x = "TissueType", y = "mixing")
+
+both_wide = dcast.data.table(both,"PID ~ TissueType",value.var = "mixing")
+
+#Test pairwise for more/less hetero in met
+t.test(both_wide$`primary tumor`, both_wide$`lymph node mts`, paired = T, alternative = "two.sided")
+t.test(both_wide$`primary tumor`, both_wide$`lymph node mts`, paired = F, alternative = "two.sided")
+
+```
+
+Alternative local heterogeneity (ratio of hetero- to homotypic interactions)
+```{r local heterogeneity alternative}
+
+#Read single-cell relationships
+rel = fread('/mnt/ZTMA_21_25_26/cpout/Object relationships.csv',header = T)
+rel = rel[Relationship == "Neighbors",]
+rel = rel[,-c("Module","Module Number")]
+
+#Get cell cluster info
+d = as.data.table(colData(sce)[,c("core","PID","combined_clusering","CellID","ImageNumber")])
+d$id = colnames(sce)
+names(d)[names(d) == "CellID"] = "ObjectNumber"
+d = d[as.numeric(as.character(combined_clusering)) >= 100,]
+ 
+#Prepare data for neighbourhood analysis
+dat_struc = prepare_tables(d, rel, col_label = 'combined_clusering'
+                   # relationship = DEFAULTRELATIONSHIP,  # Neighbors
+                   # col_imnr = IMGNR,                    # ImageNumber
+                   # col_objnr = OBJNR,                   # ObjectNumber
+                   # col_relationship = RELATIONSHIP,     # Relationship
+                   # col_objname = OBJNAME                # ObjectName
+)
+
+# #Calculate counts
+# dat_baseline_classic = apply_labels(dat_struc[[1]], dat_struc[[2]]) %>%
+#   aggregate_classic()
+
+test = dat_struc[[2]]
+test$interac_type = "heterotypic"
+test[FirstLabel == SecondLabel,interac_type := "homotypic"]
+test[,ct := .N ,by = c("interac_type","group")]
+test = unique(test[,c("group","interac_type","ct")])
+test = dcast.data.table(test, "group ~ interac_type",value.var = "ct")
+test[,ratio:= heterotypic/homotypic]
+test[,frac :=heterotypic/(heterotypic + homotypic)]
+setnames(test, "group","ImageNumber")
+
+
+
+#Calculate cluster numbers in LN mets and overall heterogeneity (as in pipeline 2)
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag',"ImageNumber")],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('ImageNumber', 'tumor_cluster_100')]
+met[,test := .N,by = "ImageNumber"]
+met = met[test >=100,]
+met = unique(met[,c("PID","tumor_cluster_100","ncells","ImageNumber")])
+met = dcast.data.table(met,"PID + ImageNumber ~ tumor_cluster_100",fill =0)
+met$entropy = apply(as.matrix(met[,-c("PID","ImageNumber")]),1,entropy.ChaoShen)
+
+#Combine
+het_mix = merge(met,test,by = "ImageNumber")
+cor_het = cor(het_mix[,c("frac","entropy")])
+
+#Scatter plot
+ggplot(het_mix,aes(x = frac, y = entropy)) + geom_point() + geom_smooth(method = lm)
+
+
+#Calculate cluster numbers in primary and overall heterogeneity (as in pipeline 2)
+prim = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag',"ImageNumber")],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+prim = prim[sizeflag != 1,]
+prim[,ncells:=.N ,by= c('ImageNumber', 'tumor_cluster_100')]
+prim[,test := .N,by = "ImageNumber"]
+prim = prim[test >=100,]
+prim = unique(prim[,c("PID","tumor_cluster_100","ncells","ImageNumber")])
+prim = dcast.data.table(prim,"PID + ImageNumber ~ tumor_cluster_100",fill =0)
+prim$entropy = apply(as.matrix(prim[,-c("PID","ImageNumber")]),1,entropy.ChaoShen)
+
+#Combine
+het_mix = merge(prim,test,by = "ImageNumber")
+cor_het = cor(het_mix[,c("frac","entropy")])
+
+#Scatter plot
+ggplot(het_mix,aes(x = frac, y = entropy)) + geom_point() + geom_smooth(method = lm)
+
+
+```
+
+Check whether heterogeneity on a community level is associated with Ki-67 or pHH3
+```{r heterogeneity vs Ki-67 or pHH3}
+
+d = merge(comm_tum,res,by = c("comm_id"))
+add = data.table(id = colnames(sce_t), as.data.table(t(counts(sce_t))))
+d = merge(d,add,by = "id")
+#d = d[TissueType == "lymph node mts",]
+d[,avg_ki67 := mean(`Er168_Ki-67`),by = "comm_id"]
+d[,avg_pHH3 := mean(`Eu153_Histone H3`),by = "comm_id"]
+d = unique(d[,c("avg_ki67","avg_pHH3","comm_id","shannon")])
+
+png("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/comm_shannon_proliferation_Ki67.png")
+ggplot(d,aes(x = shannon, y = avg_ki67))+geom_point() + theme_minimal() + theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),axis.ticks.x=element_blank(),axis.title.y=element_blank(),
+        axis.text.y=element_blank(),axis.ticks.y=element_blank())
+dev.off()
+png("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/comm_shannon_proliferation_pHH3.png")
+ggplot(d,aes(x = shannon, y = avg_pHH3))+geom_point() + theme_minimal()+ theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),axis.ticks.x=element_blank(),axis.title.y=element_blank(),
+        axis.text.y=element_blank(),axis.ticks.y=element_blank())
+dev.off()
+
+```
+
+Check whether clusters are more related within communities than between in LN mets
+```{r cluster relatedness, eval = F}
+#Read in cophenetic distances from heatmap in pipeline 2
+dend_dist = read.csv("/mnt/ZTMA_21_25_26/analysis/cophenetic_dist.csv")
+rownames(dend_dist) = dend_dist$X
+dend_dist$X = NULL
+colnames(dend_dist) = rownames(dend_dist)
+
+#Get only the high mixing ones
+res = res[TissueType == "lymph node mts",]
+ids_upper = unique(res[,c("PID","mixing")])
+ids_upper = ids_upper[mixing > quantile(mixing,0.75),]$PID
+  
+upper = data.table(res) #[PID %in% ids_upper,]
+upper = unique(upper[,c("comm_id","PID","mixing")])
+upper = merge(upper, comm_wide,by = "comm_id")
+
+mupper = melt.data.table(upper,id.vars = c("comm_id","PID","mixing","core","tot_cells","edge_cells"))
+mupper = mupper[value > 0,]
+mupper[,variable := as.numeric(as.character(variable))]
+
+#Loop through images
+acount = 1
+res = list()
+for ( i in unique(mupper$core)){
+  
+  #Current image
+  cur = mupper[core == i,]
+  avg_real = list()
+  all_cells = list()
+  count = 1
+  
+  #Loop through communities
+  for (j in unique(cur$comm_id)){
+    
+    #Current community
+    cur_comm = cur[comm_id == j,]
+    
+    #Each cells label
+    cells = rep(cur_comm$variable,cur_comm$value)
+    
+    #Pairwise cohphenetic distances between all combinations of cells
+    sim_mat = replicate(length(cells),cells)
+    colnames(sim_mat) = cells
+    rownames(sim_mat) = cells
+    cur_cophen =  dend_dist[rownames(sim_mat),colnames(sim_mat)]
+    
+    #Avg cohphenetic distance between cells in this comm
+    avg_real[count] = mean(as.matrix(cur_cophen))
+    
+    #Save cells per community
+    all_cells[[count]] =list(cells)
+    count = count + 1
+  }
+  avg_real_img = median(unlist(avg_real))
+  
+  #Prepare to permute
+  cells_img = data.table(comm_id = rep(unique(cur$comm_id),unlist(lapply(all_cells,function(x){length(x[[1]])}))),
+             cells = unlist(all_cells))
+  
+  avg_perm = list()
+  #Permute labels 1000 times
+  for (g in 1:1000){
+    cells_img_perm = data.table(comm_id = cells_img$comm_id, 
+                           cells = cells_img$cells[sample(1:nrow(cells_img),replace = F)])
+    
+    #Loop through communities
+    avg_p = list()
+    countp = 1
+    for (k in unique(cells_img_perm$comm_id)){
+      
+      #Current community
+      cur_comm = cells_img_perm[comm_id == k,]
+      
+      #Each cells label
+      cells = cur_comm$cells
+      
+      #Pairwise cohphenetic distances between all combinations of cells
+      sim_mat = replicate(length(cells),cells)
+      colnames(sim_mat) = cells
+      rownames(sim_mat) = cells
+      cur_cophen =  dend_dist[rownames(sim_mat),colnames(sim_mat)]
+      
+      #Avg cohphenetic distance between cells in this comm
+      avg_p[countp] = mean(as.matrix(cur_cophen))
+      
+      #Save cells per community
+      all_cells[[countp]] =list(cells)
+      countp = countp + 1
+    }
+    avg_perm[g] = median(unlist(avg_p))
+  }
+  
+  #Calculate p-values
+  nabove = sum(avg_perm > avg_real_img)
+  nbellow = sum(avg_perm < avg_real_img)
+  pval_lower = (nabove+1)/1000
+  pval_higher = (nbellow+1)/1000
+  
+  res[[acount]] = data.table(core = i,pval_lower = pval_lower,pval_higher = pval_higher)
+  acount = acount + 1
+  print(i)
+}
+
+#Write out results
+#out = do.call(rbind,res)
+#fwrite(out,"/mnt/ZTMA_21_25_26/analysis/permutation_comm_similarity.csv",col.names = T)
+
+```
+
+Read in results from above and plot
+```{r plot}
+#Read in p-values
+out = fread("/mnt/ZTMA_21_25_26/analysis/permutation_comm_similarity.csv",header = T)
+
+frac_sign_high= sum(out$pval_higher < 0.05)/nrow(out)
+frac_sign_low=sum(out$pval_lower < 0.05)/nrow(out)
+
+out[,sign := 0]
+out[pval_higher < 0.05,sign := 1]
+out[pval_lower < 0.05,sign := -1]
+
+out = merge(out,unique(upper[,c("core","mixing")]))
+out = out[order(mixing),]
+out[,core := factor(core,levels = core)]
+
+#Bar plot ranked by mixing
+s = ggplot(out,aes(x = 1, y = core,fill = as.factor(sign)))+
+  geom_tile()+
+  scale_fill_manual(values = c("blue","white","red"))+ 
+  theme(axis.text.y = element_blank(), axis.ticks = element_blank(),legend.position="left")
+
+#Mixing levels
+m = ggplot(out,aes(y = core, x = mixing))+
+  geom_bar(stat = "identity")+ 
+  theme(axis.text.y = element_blank(), axis.ticks = element_blank())
+
+#Plot side by side
+s | m
+
+#Combination
+sm = ggplot(out,aes(y = core, x = mixing,fill = as.factor(sign)))+
+  geom_bar(stat = "identity")+ 
+  scale_fill_manual(values = c("blue","white","red"))+ 
+  theme(axis.text.y = element_blank(), axis.ticks = element_blank())
+sm
+
+
+#LN metastases stacked bar plot with tumor cluster fractions
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+#Exclude shitty images and cells
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('core', 'tumor_cluster_100')]
+met[,test := sum(ncells),by = "core"]
+met[,frac_cluster := ncells/.N, by=c('core')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','core')])
+met = dcast.data.table(met, 'core ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+met = met[core %in% out$core,]
+met = met[order(match(core,rev(out$core))),]
+
+#Plot stacked bar plot
+draw(rowAnnotation(met = anno_barplot(met[,-'core'],gp = gpar(colour = tcols$tumor_cols[as.numeric(colnames(met)[colnames(met) != 'core'])],fill = tcols$tumor_cols[as.numeric(colnames(met)[colnames(met) != 'core'])]), width = unit(10, "cm")))+
+  rowAnnotation(rn = anno_text(met$core)))
+
+```
+
+Check for enrichments of certain clusters or communities in met/prim or between different community sizes
+```{r enrichments}
+#Plot for each community type the density in primary vs met as boxplots
+groups = as.data.table(colData(sce_t_comm)[,c("PID","pgroups","comm_cluster","Grade","Mol_Signature","pN_4gr","TissueType","core")])
+groups$comm_id = colnames(sce_t_comm)
+
+#Area for density calculation
+areas = unique(as.data.table(colData(sce_t)[,c("core","AreaTissue")]))
+
+#Calculate densities
+groups = merge(groups,areas,by = "core")
+groups[,abs_nr := .N, by = c('comm_cluster','core')]
+groups[,comm_area := abs_nr/AreaTissue, by = 'core']
+groups[,comm_area_PID := mean(comm_area),by = c('PID','comm_cluster','TissueType')]
+groups = unique(groups[,c("PID","comm_area_PID","comm_cluster","TissueType")])
+groups$comm_cluster = factor(groups$comm_cluster,levels = colnames(hm_dat[,-c('PID','pgroups','Grade','Mol_Signature','pN_4gr')])[column_order(h)$Clustergram])
+
+ggplot(groups,aes(x = comm_cluster, y = comm_area_PID,fill = TissueType)) + geom_boxplot()
+
+#Only for matched samples
+groups[,test := length(unique(TissueType)),by = "PID"]
+groups = groups[test == 2,]
+
+ggplot(groups,aes(x = comm_cluster, y = comm_area_PID,fill = TissueType)) + geom_boxplot()
+
+
+#Boxplots clusters enriched in large/small communities
+groups = as.data.table(colData(sce_t_comm)[,c("PID","tot_cells")])
+groups$comm_id = colnames(sce_t_comm)
+
+#Community size distribution
+ggplot(groups,aes(x = log(tot_cells)))+ geom_density()
+
+#Bin sizes
+groups$tot_log = log(groups$tot_cells)
+groups$size_bin[groups$tot_log < 3] = "small"
+groups$size_bin[groups$tot_log >= 3 & groups$tot_log < 4] = "medium"
+groups$size_bin[groups$tot_log >= 4] = "big"
+
+#plot number of communities per bin
+ggplot(groups,aes(x = size_bin)) + geom_histogram(stat="count")
+
+#Merge with cluster fractions
+groups = merge (groups,comm_wide_size[,- "tot_cells"],by = "comm_id")
+groups = groups[,-c("edge_cells","PID","core","tot_log")]
+groups = melt.data.table(groups,id.vars = c("comm_id","tot_cells","size_bin"))
+groups$size_bin = factor(groups$size_bin,levels = c("small","medium","big"))
+
+ggplot(groups,aes(x = variable, y= value, fill = size_bin)) + geom_boxplot()
+
+```
+
+Read and plot the microenvironment communities
+```{r microenvironment communities}
+#Read
+comm_micro = fread('/mnt/ZTMA_21_25_26/analysis/microenv_communities.csv',header = T)
+
+#Assign unique id to communities
+comm_micro[,comm_id := paste0(core,"_",community_louvain)]
+
+#Use only prim and met samples
+add = as.data.table(colData(sce)[,c("TissueType","PID","edge_bool")])
+add$id = colnames(sce)
+comms_m = merge(comm_micro,add,by = "id")
+comms_m = comms_m[TissueType %in% c("primary tumor","lymph node mts")]
+
+#Calculate
+comms_m[,tot_cells := .N, by = c("comm_id")]
+comms_m = comms_m[tot_cells > 5,]
+comms_m[,ncells := .N, by = c("comm_id","combined_clusering")]
+comms_m[,edge_cells := sum(edge_bool), by = "comm_id"]
+comms_m = unique(comms_m[,c("core", "comm_id","combined_clusering","ncells","tot_cells","edge_cells")])
+
+#Wide format with absolute number of cells
+comm_wide_m = dcast.data.table(comms_m,"core + comm_id + tot_cells + edge_cells ~ combined_clusering",value.var = "ncells",fill = 0)
+
+#Wide format normalize by size -> fraction
+comm_wide_size_m = cbind(comm_wide_m[,c("core","comm_id","tot_cells","edge_cells")],comm_wide_m[,-c("core","comm_id","tot_cells","edge_cells")]/comm_wide_m$tot_cells)
+
+#Wide format with 01-normalized absolute numbers
+comm_wide_norm_m = cbind( comm_wide_m[,c("core","comm_id","tot_cells","edge_cells")],apply(comm_wide_m[,-c("core","comm_id","tot_cells","edge_cells")],2, function(x){(x-min(x))/(max(x)-min(x))}))
+```
+
+Cluster microenv communities
+```{r,eval = F}
+
+#Make sce
+comm_mat = as.matrix(comm_wide_size_m[,-c("core","comm_id","tot_cells","edge_cells")])
+rownames(comm_mat) = comm_wide_size_m$comm_id
+comm_mat = t(comm_mat)
+sce_comm <- SingleCellExperiment(assays = list(counts = comm_mat ))
+df = DataFrame(comm_wide_size_m[,c("core","tot_cells","edge_cells")])
+rownames(df) = colnames(sce_comm)
+colData(sce_comm) = df
+
+#Add metadata
+meta = unique(as.data.table(colData(sce_t)[,c("core",'Mol_Signature',"Grade","TissueType","pN_4gr","PID","pgroups")]))
+meta = merge(as.data.table(colData(sce_comm)),meta,by = "core",all.x = T)
+meta = DataFrame(meta)
+rownames(meta) = colnames(sce_comm)
+colData(sce_comm) = DataFrame(meta)
+
+#Run PhenoGraph
+rand_seed = 3
+rpheno_out = cytofkit::Rphenograph(t(counts(sce_comm)), k = 30, seed = rand_seed,approx = T)
+sce_comm$comm_cluster = as.character(igraph::membership(rpheno_out))
+  
+#Run umap
+sce_comm = runUMAP(sce_comm, exprs_values = "counts", n_neighbors = 50, min_dist = 0.7, external_neighbors=TRUE, BPPARAM = MulticoreParam())
+sce_comm$dummy = 1
+
+#Get normalized majority celltype color for each comm_cluster
+m = as.data.table(colData(sce_comm)[,c("comm_cluster")])
+names(m) = "comm_cluster"
+m$comm_id = colnames(sce_comm)
+m = merge(comm_wide_size_m,m,by = "comm_id")
+m = aggregate(m[,-c("comm_cluster","core","comm_id","edge_cells")], by=list(m$comm_cluster),
+  FUN=mean, na.rm=TRUE)
+m$max_type = apply(m[,colnames(m)[!colnames(m) %in% c("Group.1","tot_cells")]],1,function(x){colnames(m)[!colnames(m) %in% c("Group.1","tot_cells")][x == max(x)]})
+m_cols = unique(m[,c("Group.1","max_type")])
+colnames(m_cols)[2] = "cluster"
+sm_cols = rbind(scols,data.frame(stroma_cols = "black",cluster = 32))
+m_cols = merge(m_cols,sm_cols,by = "cluster")
+m_cols = m_cols[order(m_cols$Group.1),]
+
+#fwrite(m_cols,"/mnt/ZTMA_21_25_26/analysis/cols_microenv_comm.csv",col.names = T)
+#saveRDS(sce_comm,'/mnt/ZTMA_21_25_26/analysis/SCE_Community_microenv.rds')
+```
+
+Visualize microenvironment communities
+```{r visualize}
+#Read community sce
+sce_comm = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_Community_microenv.rds')
+
+#Read in colormap
+m_cols = fread("/mnt/ZTMA_21_25_26/analysis/cols_microenv_comm.csv",header = T)
+sm_cols = rbind(scols,data.frame(stroma_cols = "black",cluster = 32))
+
+#Plot UMAPS
+print(plotReducedDim(sce_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "comm_cluster") + scale_color_manual(values = as.character(m_cols$stroma_cols)))
+print(plotReducedDim(sce_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "comm_cluster") + scale_color_manual(values = col_vector))
+print(plotReducedDim(sce_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "TissueType"))
+print(plotReducedDim(sce_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "tot_cells"))
+print(plotReducedDim(sce_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "pN_4gr"))
+print(plotReducedDim(sce_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "Mol_Signature"))
+print(plotReducedDim(sce_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "Grade"))
+print(plotReducedDim(sce_comm, dimred = "UMAP", shape_by = "dummy", colour_by = "edge_cells"))
+  
+cur_mol_col = cols_mol[Mol_Signature %in% unique(sce_comm$Mol_Signature),]
+cur_g_col = cols_grade[Grade %in% unique(sce_comm$Grade),]
+cur_n_col = cols_pN_4gr[pN_4gr %in% unique(sce_comm$pN_4gr),]
+
+#Actual absolute numbers of cells
+m = as.data.table(colData(sce_comm)[,c("comm_cluster")])
+names(m) = "comm_cluster"
+m$comm_id = colnames(sce_comm)
+m = merge(comm_wide_size_m,m,by = "comm_id")
+m = aggregate(m[,-c("comm_cluster","core","comm_id","edge_cells")], by=list(m$comm_cluster),
+  FUN=mean, na.rm=TRUE)
+
+#Patient heatmap
+hm_dat = as.data.table(colData(sce_comm)[,c("PID","pgroups","comm_cluster","Grade","Mol_Signature","pN_4gr","TissueType")])
+hm_dat[,both := .N, by = c('comm_cluster','PID',"TissueType")]
+hm_dat[,frac_patient := both/.N, by = c('PID',"TissueType")]
+hm_dat = unique(hm_dat)
+hm_dat = dcast.data.table(hm_dat,"TissueType + PID + pgroups + Grade + Mol_Signature + pN_4gr ~ comm_cluster",value.var = "frac_patient",fill = 0)
+
+mgroups = unique(as.data.table(colData(sce_t)[,c("PID","mgroups")]))
+hm_dat = merge(hm_dat,mgroups,by = "PID",all.x = T)
+
+hm_dat[TissueType != "lymph node mts",mgroups := NA]
+hm_dat[TissueType != "primary tumor",pgroups := NA]
+
+column_ha = HeatmapAnnotation(nr_cells = anno_barplot(m[,colnames(m)[!colnames(m) %in% c('max_type',"Group.1","tot_cells")]],gp = gpar(fill = as.character(sm_cols$stroma_cols), col = as.character(sm_cols$stroma_cols)),height = unit(40, "mm")))
+h = Heatmap(as.matrix(hm_dat[,-c('PID','pgroups','Grade','Mol_Signature','pN_4gr','TissueType','mgroups')]), name = "Clustergram", km = 1, col = colorRamp2(c(0, 1), c("white", "red")),
+            show_row_names = F, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2", top_annotation = column_ha)+
+  Heatmap(hm_dat$pgroups, name = "pgroups", show_row_names = F, width = unit(10, "mm"), col = structure(pcols$col, names = pcols$pgroups))+
+  Heatmap(hm_dat$mgroups, name = "mgroups", show_row_names = F, width = unit(10, "mm"), col = structure(mcols$col, names = mcols$pgroups))+
+  Heatmap(hm_dat$Grade, name = "Grade", show_row_names = F, width = unit(10, "mm"), col = structure(cols_grade$col, names = cols_grade$Grade))+
+  Heatmap(hm_dat$Mol_Signature, name = "Mol_Signature", show_row_names = F, width = unit(10, "mm"), col = structure(cols_mol$col, names = cols_mol$Mol_Signature))+
+  Heatmap(hm_dat$pN_4gr, name = "pN_4gr", show_row_names = F, width = unit(10, "mm"), col = structure(cols_pN_4gr$col, names = cols_pN_4gr$pN_4gr))+
+  Heatmap(hm_dat$TissueType, name = "tissue", show_row_names = F, width = unit(10, "mm"), col = structure(c("blue","purple"), names = c("primary tumor","lymph node mts")))
+
+
+#Celltype correlation within communities by fraction
+cor_CT_comm = cor(comm_wide_size_m[,-c("core","comm_id","tot_cells","edge_cells")])
+
+#Clustered heatmap
+ha_mix = HeatmapAnnotation(tumor = colnames(cor_CT_comm),
+    col = list(tumor = structure(sm_cols$stroma_cols,names = sm_cols$cluster)))
+hm_corr_CT_comm = Heatmap(cor_CT_comm, name = "correlation of CTs within tumor comm",column_title = "correlation of CTs within tumor comm", km = 1, col = colorRamp2(c(-1,0, 1), c('blue',"white", "red")),show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_mix)+
+  rowAnnotation(rn = anno_text(rownames(cor_CT_comm)))
+hm_corr_CT_comm
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/microenv_comm.pdf", height = 10, width = 20)
+h
+dev.off()
+
+o = column_order(h)$Clustergram
+
+```
+
+Cell state markers comm
+```{r, cell state}
+#Add community type
+add = data.table(comm_id = colnames(sce_comm), comm_type = sce_comm$comm_cluster)
+d = merge(comm_micro, add, by = "comm_id")
+
+#Add single-cell expressions
+add = data.table(id = colnames(sce_t),as.data.table(t(counts(sce_t)))) #only interested in cell state markers of tumor cells
+d = merge(d,add,by = "id", all.x = T)
+
+#Remove non-cell state markers
+d = d[,c("id","core","comm_type","Er168_Ki-67","Er170_S6","Yb176_Cleaved Caspase3","Eu153_Histone H3","Er166_Carbonic Anhydrase IX")]
+d = melt.data.table(d, id.vars = c("id","core","comm_type"),variable.name = "cell state marker", value.name = "expr")
+
+#Order according to heatmap
+d[,comm_type := factor(comm_type, levels = o)]
+m_cols = m_cols[,Group.1 := as.factor(Group.1)]
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/cell_state_markers.pdf",width = 20)
+ggplot(d, aes(x = `cell state marker`, y = expr, fill = comm_type))+geom_boxplot(outlier.shape = NA) + scale_fill_manual(values = m_cols[order(match(Group.1,o)),]$stroma_cols)+theme_minimal()
+dev.off()
+
+for ( i in unique(d$`cell state marker`)){
+  cur = d[`cell state marker` == eval(i),]
+  cur[,means := mean(na.omit(expr)),by = "comm_type"]
+  cur = cur[order(means),]
+  cur[,comm_type := factor(comm_type, levels = unique(comm_type))]
+  pdf(paste0("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/",eval(i),".pdf"))
+  print(ggplot(cur, aes(x = `cell state marker`, y = expr, fill = comm_type))+geom_boxplot(outlier.shape = NA) + scale_fill_manual(values = m_cols[order(match(Group.1,levels(cur$comm_type))),]$stroma_cols)+theme_minimal())
+  dev.off()
+}
+
+#Cell state marker changes betw primary and ln met
+add = data.table(id = colnames(sce_t), TissueType = sce_t$TissueType)
+add = add[TissueType %in% c("primary tumor","lymph node mts"),]
+d = merge(d, add, all.x = T, by = "id")
+d = na.omit(d)
+d$TissueType = factor(d$TissueType,levels = c("primary tumor","lymph node mts"))
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/cell_state_markers_pLNmet.pdf",width = 20)
+ggplot(d, aes(x = `cell state marker`, y = expr, fill = TissueType))+geom_boxplot(outlier.shape = NA) + scale_fill_manual(values = c("blue","purple"))+theme_minimal()
+dev.off()
+
+
+#Add barplots with numbers of cells primary LN met
+add = data.table(id = colnames(sce_t), TissueType = sce_t$TissueType, tumor_cluster = sce_t$tumor_cluster_100)
+add = add[TissueType %in% c("primary tumor","lymph node mts"),]
+
+d = merge(d, add, all.x = T, by = "id")
+d = unique(d[,-c("cell state marker","expr")])
+d = na.omit(d)
+d[,ntissue := .N,by = c("TissueType","comm_type")]
+d[,frac_tissue := ntissue/.N,by = "comm_type"]
+
+cur = unique(d[,c("TissueType","comm_type","frac_tissue")])
+cur = cur[order(TissueType,frac_tissue),]
+cur$comm_type = factor(cur$comm_type, levels = unique(cur$comm_type))
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/frac_LN.pdf")
+ggplot(cur, aes(x = comm_type, y = frac_tissue,  fill = TissueType))+geom_bar(stat = "identity") + scale_fill_manual(values = c("purple","blue"))+theme_minimal()
+dev.off()
+o = unique(cur$comm_type)
+
+#Fraction cluster 29
+d$cluster29 = 0
+d[tumor_cluster == "29",cluster29 := 1]
+d[,ncl := .N,by = c("cluster29","comm_type")]
+d[,frac_cl := ncl/.N,by = "comm_type"]
+
+cur = unique(d[,c("cluster29","comm_type","frac_cl")])
+cur = cur[order(cluster29,frac_cl),]
+cur$comm_type = factor(cur$comm_type, levels = o)
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/frac_p53.pdf")
+ggplot(cur, aes(x = comm_type, y = frac_cl,  fill = as.factor(cluster29)))+geom_bar(stat = "identity") + scale_fill_manual(values = c("black","turquoise"))+theme_minimal()
+dev.off()
+
+```
+
+
+Enrichments of clusters/communities in met/prim or different community sizes
+```{r enrichments}
+#Plot for each community type density in primary vs met as boxplots
+groups = as.data.table(colData(sce_comm)[,c("PID","pgroups","comm_cluster","Grade","Mol_Signature","pN_4gr","TissueType","core")])
+groups$comm_id = colnames(sce_comm)
+
+#Area for density calculation
+areas = unique(as.data.table(colData(sce_t)[,c("core","AreaTissue")]))
+
+groups = merge(groups,areas,by = "core")
+groups[,abs_nr := .N, by = c('comm_cluster','core')]
+groups[,comm_area := abs_nr/AreaTissue, by = 'core']
+groups[,comm_area_PID := mean(comm_area),by = c('PID','comm_cluster',"TissueType")]
+groups = unique(groups[,c("PID","comm_area_PID","comm_cluster","TissueType")])
+groups$comm_cluster = factor(groups$comm_cluster,levels = colnames(hm_dat[,-c("pgroups","Mol_Signature","PID","Grade","pN_4gr")])[column_order(h)$Clustergram])
+
+ggplot(groups,aes(x = comm_cluster, y = comm_area_PID,fill = TissueType)) + geom_boxplot()
+
+#Only for matched samples
+groups[,test := length(unique(TissueType)),by = "PID"]
+groups = groups[test == 2,]
+
+ggplot(groups,aes(x = comm_cluster, y = comm_area_PID,fill = TissueType)) + geom_boxplot()
+
+
+#Boxplots celltype enriched in large/small communities
+groups = as.data.table(colData(sce_comm)[,c("PID","tot_cells")])
+groups$comm_id = colnames(sce_comm)
+groups$size_bin[groups$tot_cells < 20] = "very small"
+groups$size_bin[groups$tot_cells >= 20 & groups$tot_cells < 60] = "small"
+groups$size_bin[groups$tot_cells >= 60 & groups$tot_cells < 100] = "big"
+groups$size_bin[groups$tot_cells >= 100] = "very big"
+
+#Merge with cluster fractions
+groups = merge (groups,comm_wide_size_m[,- "tot_cells"],by = "comm_id")
+groups = groups[,-c("edge_cells","PID","core")]
+groups = melt.data.table(groups,id.vars = c("comm_id","tot_cells","size_bin"))
+groups$size_bin = factor(groups$size_bin,levels = c("very small","small","big","very big"))
+
+ggplot(groups,aes(x = variable, y= value, fill = size_bin)) + geom_boxplot()
+
+```
+
+Overlap between tumor and microenvironment communities (tumor cell types associtaed with which microenv communities)
+```{r community overlap}
+#Actual absolute numbers of cells
+m = as.data.table(colData(sce_comm)[,c("comm_cluster")])
+names(m) = "comm_cluster"
+m$comm_id = colnames(sce_comm)
+
+#Merge with single-cell ids
+m = merge(m,comm_micro,by = "comm_id")
+
+#Merge with tumor clusters
+tumor_clus = data.table(tumor_cluster_100 = sce_t$tumor_cluster_100, id = colnames(sce_t))
+m = merge(m,tumor_clus,by = "id")
+
+#Calc fraction per community type
+m[,ncells := .N,by = c("comm_cluster","tumor_cluster_100")]
+m[,frac_comm_type := ncells/.N,by = "comm_cluster"]
+m= unique(m[,c("comm_cluster","tumor_cluster_100","frac_comm_type")])
+m$comm_cluster  = factor(m$comm_cluster,levels = colnames(hm_dat[,-c('PID','pgroups','Grade','Mol_Signature','pN_4gr','TissueType')])[column_order(h)$Clustergram])
+m$tumor_cluster_100 = factor(m$tumor_cluster_100,levels = order_tumor$V1)
+
+ggplot(m, aes(x = comm_cluster,y = frac_comm_type,fill = tumor_cluster_100))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = tcols[order(match(cluster,as.numeric(as.character(levels(m$tumor_cluster_100))))),]$tumor_cols)+
+  theme(axis.text.x = element_text(face="bold", color=m_cols[order(match(Group.1,as.numeric(as.character(levels(m$comm_cluster)))))]$stroma_cols))
+
+#Order by fraction of CT 29
+fracs = m[tumor_cluster_100 == "29",]
+fracs = fracs[order(frac_comm_type),]
+m$comm_cluster  = factor(m$comm_cluster,levels = fracs$comm_cluster)
+
+ggplot(m, aes(x = comm_cluster,y = frac_comm_type,fill = tumor_cluster_100))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = tcols[order(match(cluster,as.numeric(as.character(levels(m$tumor_cluster_100))))),]$tumor_cols)+
+  theme(axis.text.x = element_text(face="bold", color=m_cols[order(match(Group.1,as.numeric(as.character(levels(m$comm_cluster)))))]$stroma_cols))
+
+
+```
+
+

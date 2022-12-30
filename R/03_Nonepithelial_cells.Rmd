@@ -1,0 +1,873 @@
+---
+title: "Analysis_pipeline3"
+author: "Jana Fischer"
+date: "2/27/2020"
+output: html_document
+---
+
+Analysis focused on non-epithelial cells of the tumor microenvironment
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+library(data.table)
+library(SingleCellExperiment)
+library(ggplot2)
+library(RColorBrewer)
+library(scater)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(patchwork)
+library(survival)
+library(broom)
+library(diffcyt)
+library(edgeR)
+```
+
+Prepare frequently used color maps and define non-epithelial markers
+```{r prepare}
+#Set global seed
+set.seed(3)
+
+#Define general color map of distinguishable colors
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+col_vector = unique(col_vector)
+
+#Read in colormaps for the frequently used metadata
+cols_mol = fread("/mnt/ZTMA_21_25_26/analysis/cols_mol.csv",header = T)
+cols_grade = fread("/mnt/ZTMA_21_25_26/analysis/cols_grade.csv",header = T)
+cols_pN_4gr = fread("/mnt/ZTMA_21_25_26/analysis/cols_pN_4gr.csv",header = T)
+cols_tissue = fread("/mnt/ZTMA_21_25_26/analysis/cols_tissue",header = T)
+
+#Color maps defined in previous pipelines
+tcols = fread('/mnt/ZTMA_21_25_26/analysis/tcols.csv',header = T)
+scols = fread('/mnt/ZTMA_21_25_26/analysis/scols.csv',header = T)
+pcols = fread('/mnt/ZTMA_21_25_26/analysis/pcols.csv',header = T)
+mcols = fread('/mnt/ZTMA_21_25_26/analysis/mcols.csv',header = T)
+order_tumor = fread('/mnt/ZTMA_21_25_26/analysis/order_tumor.csv',header = T)
+order_stroma = fread('/mnt/ZTMA_21_25_26/analysis/order_stroma.csv',header = T)
+
+#Select channels to use for non-epithelial cell clustering
+stroma_channels = c("Dy162_CD45","Dy164_CD20","Ho165_CD8a","Nd145_CD15","Nd146_CD68","Sm154_CD11c","Yb171_CD4","Yb172_vWF","Sm152_CD3","Nd148_SMA","Nd142_Fibronectin","Sm149_Vimentin","Nd143_HLA-DR","Gd155_Bcl-2","Dy163_GATA3")
+
+```
+
+Non-epithelial cell subclustering
+```{r non-epithelial cell clustering, eval = F}
+#Read in sce
+sce = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_PG.rds')
+
+#Pick PG clusters containing tumor cells based on gaussian mixture model majority vote and manual curation based on heatmap generated at the end of pipeline1
+tumor = as.numeric(as.character(unique(sce$PG_clusters)))[!as.numeric(as.character(unique(sce$PG_clusters))) %in% c(60,59,126,115,82,26,16,125,11,70,36,103,44,42,61,34)]
+
+#Create a subset sce that includes only the tumor cells
+sce_s <- subset(sce, , !PG_clusters %in% tumor)
+
+#Run PG on non-epithelial cells
+rpheno_out = cytofkit::Rphenograph(t(counts(sce_s[stroma_channels,])), k = 50, seed = 3, approx=T)
+sce_s$stroma_cluster = as.factor(igraph::membership(rpheno_out))
+
+#Save stromal sce with clusteri assignments
+saveRDS(sce_s, file = '/mnt/ZTMA_21_25_26/analysis/SCE_S.rds', ascii = FALSE)
+
+```
+
+Heatmap of non-epithelial clusters
+```{r heatmap non-epithelial cells}
+#Read in stromal sce_s data with PG info already included
+sce_s = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_S.rds')
+
+#Prepare data for heatmap of markers used for clustering
+sum = sumCountsAcrossCells(sce_s[stroma_channels,],average = T,colData(sce_s[stroma_channels,])$stroma_cluster, exprs_values = "counts")
+p_dat = scale(t(sum))
+p_dat[p_dat > 3] =3
+p_dat[p_dat < -3] =-3
+
+#Prepare data for heatmap of additional markers (not used in clustering but still nice to visualize)
+sum = sumCountsAcrossCells(sce_s[!rownames(sce_s) %in% c(stroma_channels,"Dy161_Androgen Receptor AR","Er167_E-Cadherin / P-Cadherin","Eu151_c-erbB-2 - Her2","Gd156_Estrogen Receptor Alpha","Gd158_Progesterone Receptor A/B","Gd160_CD44","Ir193_Iridium","La139_H3K27me3","Lu175_Keratin Epithelial","Nd150_c-Myc","Nd144_Cytokeratin 8/18","Pr141_Cytokeratin 5","Sm147_Keratin 14 (KRT14)","Tb159_p53","Tm169_EGFR","Yb173_mTOR","Yb174_Cytokeratin 7")],average = T,colData(sce_s[stroma_channels,])$stroma_cluster, exprs_values = "counts")
+p_dat_side = scale(t(sum))
+p_dat_side[p_dat_side > 3] =3
+p_dat_side[p_dat_side < -3] =-3
+
+#Prepare data for heatmap of spatial single-cell features
+spatial = as.data.table(colData(sce_s)[c('Neighbors_NumberOfNeighbors_4','Neighbors_PercentTouching_4', "AreaShape_Area", "stroma_cluster")])
+spatial = aggregate(spatial[,-"stroma_cluster"],by = list(stroma_cluster = spatial$stroma_cluster),FUN = mean)
+rnames = spatial$stroma_cluster
+spatial = as.matrix(spatial[,colnames(spatial)[colnames(spatial) != "stroma_cluster"]])
+rownames(spatial) = rnames
+spatial = scale(spatial)
+
+#Calculate absolute number of cells in each cluster and fraction of cells of each tissue type
+nr_met = table(colData(sce_s)[c('stroma_cluster','TissueType')])
+fr_met = as.data.table(nr_met)
+nr_met = rowSums(nr_met)
+fr_met[,fr := N/sum(N),by = "stroma_cluster"]
+fr_met = dcast.data.table(fr_met,"stroma_cluster ~ TissueType", value.var = "fr")
+rnames = fr_met$stroma_cluster
+fr_met=as.matrix(fr_met[,-"stroma_cluster"])
+rownames(fr_met) = rnames
+fr_met = fr_met[order(as.numeric(rownames(fr_met))),]
+
+#Calculate fraction of cells from each molecular subtype in each cluster to visualize as bubble plot
+bubble = as.data.table(colData(sce_s)[c('stroma_cluster','Mol_Signature',"TissueType")])
+bubble = bubble[!is.na(Mol_Signature),]
+bubble[TissueType != "primary tumor",Mol_Signature := "Non primary"]
+bubble[,both := .N, by=c('stroma_cluster','Mol_Signature')]
+bubble[,frac_subcluster := both/.N ,by = 'stroma_cluster']
+bubble[,frac_type := both/.N ,by = 'Mol_Signature']
+bubble_size = unique(bubble[,c('stroma_cluster','Mol_Signature','frac_subcluster')])
+bubble_alpha = unique(bubble[,c('stroma_cluster','Mol_Signature','frac_type')])
+
+#As bubble size visualize fraction of cluster cells in molecular subtype
+bubble_size = dcast.data.table(bubble_size,'stroma_cluster ~ Mol_Signature',value.var = 'frac_subcluster',fill= 0)
+rnames = bubble_size$stroma_cluster
+bubble_size = as.matrix(bubble_size[,-'stroma_cluster'])
+rownames(bubble_size) = rnames
+
+#As bubble alpha visualize fraction of molecular subtype cells in cluster
+bubble_alpha = dcast.data.table(bubble_alpha,'stroma_cluster ~ Mol_Signature',value.var = 'frac_type',fill= 0)
+rnames = bubble_alpha$stroma_cluster
+bubble_alpha = as.matrix(bubble_alpha[,-'stroma_cluster'])
+rownames(bubble_alpha) = rnames
+
+#Define color map for bubbles
+col_fun = circlize::colorRamp2(c(0, max(bubble_alpha)), c("lightblue", "darkblue"))
+
+#Plot heatmap
+h_clusters_stroma = Heatmap(p_dat, name = "clustered",column_title = "clustering markers", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  Heatmap(p_dat_side, name = "additional",column_title = "additional markers", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  Heatmap(spatial, name = "spatial",column_title = "spatial", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  rowAnnotation(axis_reverse = anno_barplot(fr_met, width = unit(20, "mm"),gp = gpar(fill = 2:7, col = 2:7)))+
+  rowAnnotation(axis_reverse = anno_barplot(nr_met, width = unit(20, "mm"),gp = gpar(fill = 2:7, col = 2:7)))+
+  rowAnnotation(rn = anno_text(rownames(p_dat)))+
+    Heatmap(bubble_alpha, name = "bubbles", col = col_fun, rect_gp = gpar(type = "none"), 
+          cell_fun = function(j, i, x, y, width, height, fill) {
+              grid.circle(x = x, y = y, r = abs((bubble_size[i, j])*2) * min(unit.c(width, height)), 
+                          gp = gpar(fill = col_fun(bubble_alpha[i, j]), col = NA))
+          },show_row_names = F)
+
+
+#Define colors for the non-epithelial clusters
+stroma_cols = c(colors()[grep("lightgreen",colors())][1],
+                colors()[grep("green",colors())][17],
+                colors()[grep("greenyellow",colors())][1],
+                colors()[grep("green",colors())][16],
+                colors()[grep("olivegreen",colors())][c(1,4)],
+                colors()[grep("palegreen",colors())][1:3],
+                 colors()[grep("yellow",colors())][9:10],
+                colors()[grep("skyblue",colors())][1:3],
+                colors()[grep("seagreen",colors())][1],
+                colors()[grep("yellow",colors())][8],
+                colors()[grep("springgreen",colors())][3],
+                colors()[grep("lightblue",colors())][1:2],
+                colors()[grep("cyan",colors())][1],
+                colors()[grep("springgreen",colors())][1:2],
+                colors()[grep("steelblue",colors())][4:8],
+                colors()[grep("yellow",colors())][3],
+                colors()[grep("steelblue",colors())][1:3]
+                )#low bottom
+
+stroma_cols = stroma_cols[order(row_order(h_clusters_stroma))]
+scols = as.data.table(stroma_cols)
+scols$cluster = 1:31
+
+#Save out non-epithelial cluster colors
+fwrite(scols,'/mnt/ZTMA_21_25_26/analysis/scols.csv',col.names = T)
+fwrite(as.data.table(row_order(h_clusters_stroma)),'/mnt/ZTMA_21_25_26/analysis/order_stroma.csv',col.names = T)
+
+#Plot heatmap with stromal cell cluster colorbar
+h_clusters_stroma = Heatmap(p_dat, name = "clustered",column_title = "clustering markers", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  Heatmap(scols$cluster, name = "cols", show_row_names = F, width = unit(10, "mm"), col = scols$stroma_cols)+
+  Heatmap(p_dat_side, name = "additional",column_title = "additional markers", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  Heatmap(spatial, name = "spatial",column_title = "spatial", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  rowAnnotation(fractions = anno_barplot(fr_met, width = unit(20, "mm"),gp = gpar(fill = cols_tissue[order(match(TissueType,colnames(fr_met))),]$col, col = cols_tissue[order(match(TissueType,colnames(fr_met))),]$col)))+
+  rowAnnotation(abs_Nr = anno_barplot(nr_met, width = unit(20, "mm"),gp = gpar(fill = "grey", col = "black")))+
+  rowAnnotation(rn = anno_text(rownames(p_dat)))+
+    Heatmap(bubble_alpha, name = "bubbles", col = col_fun, rect_gp = gpar(type = "none"), 
+          cell_fun = function(j, i, x, y, width, height, fill,alpha) {
+              grid.circle(x = x, y = y, r = abs((bubble_size[i, j])*2) * min(unit.c(width, height)), 
+                          gp = gpar(fill = col_fun(bubble_alpha[i, j]), col = NA))
+          },show_row_names = F)
+h_clusters_stroma
+
+#Prettier versiom of the bubble plot separately
+p = unique(bubble[,c("stroma_cluster","Mol_Signature","frac_subcluster","frac_type")])
+p$stroma_cluster = factor(p$stroma_cluster, levels = rev(rownames(p_dat)[row_order(h_clusters_stroma)]))
+p$Mol_Signature = factor(p$Mol_Signature, levels = c("Non primary","HER2","Triple negative","#NULL!","Luminal A","Luminal B (HER2+)","Luminal B (HER2-)"))
+
+ggplot(p,aes(x = Mol_Signature, y = stroma_cluster,alpha = ifelse(frac_subcluster==0, NA, frac_subcluster), size = ifelse(frac_type==0, NA, frac_type),color = stroma_cluster)) + geom_point()+
+  scale_color_manual(values = scols[order(match(cluster, levels(p$stroma_cluster)))]$stroma_cols)+theme_minimal()+ scale_size_continuous(range = c(0.1, 10))
+
+```
+
+Run tsne and umap
+```{r run tSNE,eval = F}
+#In case this wasn't yet set
+set.seed(3)
+
+#Define number of cores to use for parallelization
+require(doParallel)
+options('mc.cores' = 20)
+registerDoParallel(20)
+
+#Subsample 10% of cells from each core
+sub = colData(sce_s)[c('core')]
+sub$id = rownames(sub)
+sub = as.data.table(sub)
+sub = ddply(sub,.(core),function(x) x[sample(nrow(x),nrow(x)/10, replace = F),])
+sce_s_sub = sce_s[stroma_channels,sub$id]
+
+#Run umap and tsne
+sce_s_sub = runUMAP(sce_s_sub, exprs_values = "counts", external_neighbors=TRUE, BPPARAM = MulticoreParam())
+sce_s_sub = runTSNE(sce_s_sub, exprs_values = "counts", external_neighbors=TRUE, BPPARAM = MulticoreParam())
+
+#Save out subsampled stroma sce including dimensionality reduction info
+#saveRDS(sce_s_sub, file = '/mnt/ZTMA_21_25_26/analysis/SCE_S_sub_dimRed.rds', ascii = FALSE)
+```
+
+Plot TSNEs of non-epithelial cells only
+```{r plot tSNEs}
+#Read in subsampeled sce_s incl dim red info
+sce_s_sub = readRDS(file = '/mnt/ZTMA_21_25_26/analysis/SCE_S_sub_dimRed.rds')
+
+#Shape dummy variable
+sce_s_sub$dummy = 1
+
+#Order factors according to color order
+sce_s_sub$Mol_Signature = factor(sce_s_sub$Mol_Signature, levels = cols_mol$Mol_Signature)
+sce_s_sub$Grade = factor(sce_s_sub$Grade, levels = cols_grade$Grade)
+sce_s_sub$pN_4gr = factor(sce_s_sub$pN_4gr, levels = cols_pN_4gr$pN_4gr)
+
+#t-SNEs
+red = as.data.table(reducedDims(sce_s_sub)$TSNE)
+shuffle = sample(nrow(red),replace = F)
+
+#Dot density
+ggplot(red, aes(x=V1, y=V2))+
+  stat_bin2d(aes(color=..count..), bins=300, geom='point', size=1.4, fill=1)+
+  scale_color_viridis(trans = "log10", option='inferno')
+
+#Plot tissue type
+plotTSNE(sce_s_sub[,shuffle], shape_by = "dummy", colour_by = "TissueType")
+
+#Plot TMA number
+plotTSNE(sce_s_sub[,shuffle], shape_by = "dummy", colour_by = "ArrayNr")+ scale_color_manual(values = col_vector)
+
+#Plot pathology grade
+plotTSNE(sce_s_sub[,shuffle], shape_by = "dummy", colour_by = "Grade")+ scale_color_manual(values = cols_grade$col)
+
+#Plot nodal status
+plotTSNE(sce_s_sub[,shuffle], shape_by = "dummy", colour_by = "pN_4gr")+ scale_color_manual(values = cols_pN_4gr$col)
+
+#Plot molecular subtype
+plotTSNE(sce_s_sub[,shuffle], shape_by = "dummy", colour_by = "Mol_Signature")+ scale_color_manual(values = cols_mol$col)
+
+#Plot histological subtype
+plotTSNE(sce_s_sub[,shuffle], shape_by = "dummy", colour_by = "TumorSubtype_3gr")
+
+#Plot TNM_M status
+plotTSNE(sce_s_sub[,shuffle], shape_by = "dummy", colour_by = "M_string")
+
+#Plot non-epithel cell clusters
+plotTSNE(sce_s_sub[,shuffle], shape_by = "dummy", colour_by = "stroma_cluster")+ scale_color_manual(values = scols$stroma_cols)
+
+#Expression values of non-epithelial markers
+lapply(rownames(sce_s_sub),function(x){plotTSNE(sce_s_sub, shape_by = "dummy", by_exprs_values = "counts", colour_by = x)})
+
+```
+
+Visualize non-epithelial cell type composition of different pgroups/mgroups (defined in previous pipeline)
+```{r non-epithelial cells in pgroups}
+#Read in tumor sce
+sce_t = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_T.rds')
+grps = unique(as.data.table(colData(sce_t)[,c("PID","pgroups","mgroups","AreaTissue","core")]))
+grps[,areaPID := mean(AreaTissue),by = "PID"]
+grps = unique(grps[,c("PID","pgroups","mgroups", "areaPID")])
+
+#Combine with non-epithelial clusters
+str = as.data.table(colData(sce_s)[,c("PID","TissueType","stroma_cluster")])
+str$id = colnames(sce_s)
+str = merge(str,grps,by = "PID")
+str = str[!is.na(PID),]
+
+#Calculate non-epithelial cell cluster densities per pgroup in primaries
+prim = str[TissueType == "primary tumor",]
+prim[,both := .N ,by = c("PID","stroma_cluster")]
+prim[,dens := both/areaPID]
+prim[,sum_dens := sum(dens),by = c("pgroups","stroma_cluster")]
+prim[,frac_pgroups := sum_dens/.N ,by = "pgroups"] #normalize by patient group size
+prim = unique(prim[,c("frac_pgroups","pgroups","stroma_cluster")])
+prim = prim[!is.na(pgroups),]
+
+#Order according to cluster similarities
+prim$stroma_cluster = factor(prim$stroma_cluster,levels = row_order(h_clusters_stroma))
+p1 = ggplot(prim, aes(x = as.factor(pgroups), y = frac_pgroups, fill  = stroma_cluster)) + 
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = scols[order(match(cluster, as.numeric(as.character(levels(prim$stroma_cluster))))),]$stroma_cols)+
+  ggtitle("Primary")
+
+#Calculate non-epithelial cell cluster densities per pgroup in LN mets
+met = str[TissueType == "lymph node mts",]
+met[,both := .N ,by = c("pgroups","stroma_cluster")]
+met[,dens := both/areaPID]
+met[,sum_dens := sum(dens),by = c("pgroups","stroma_cluster")]
+met[,frac_pgroups := sum_dens/.N ,by = "pgroups"]
+met = unique(met[,c("frac_pgroups","pgroups","stroma_cluster")])
+met = met[!is.na(pgroups),]
+
+#Order according to cluster similarities
+met$stroma_cluster = factor(met$stroma_cluster,levels = row_order(h_clusters_stroma))
+p2 = ggplot(met, aes(x = as.factor(pgroups), y = frac_pgroups, fill  = stroma_cluster)) + 
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = scols[order(match(cluster, as.numeric(as.character(levels(met$stroma_cluster))))),]$stroma_cols)+
+  ggtitle("Met")
+
+#Plot side by side
+p1 + p2
+
+
+#Calculate non-epithelial cell cluster densities per mgroup in primary tumors
+prim = str[TissueType == "primary tumor",]
+prim[,both := .N ,by = c("mgroups","stroma_cluster")]
+prim[,dens := both/areaPID]
+prim[,sum_dens := sum(dens),by = c("mgroups","stroma_cluster")]
+prim[,frac_pgroups := sum_dens/.N ,by = "mgroups"]
+prim = unique(prim[,c("frac_pgroups","mgroups","stroma_cluster")])
+prim = prim[!is.na(mgroups),]
+
+#Order meaningful
+prim$stroma_cluster = factor(prim$stroma_cluster,levels = row_order(h_clusters_stroma))
+
+p1 = ggplot(prim, aes(x = as.factor(mgroups), y = frac_pgroups, fill  = stroma_cluster)) + 
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = scols[order(match(cluster, as.numeric(as.character(levels(prim$stroma_cluster))))),]$stroma_cols)+
+  ggtitle("Primary")
+
+#Calculate non-epithelial cell cluster densities per mgroup in LN mets
+met = str[TissueType == "lymph node mts",]
+met[,both := .N ,by = c("mgroups","stroma_cluster")]
+met[,dens := both/areaPID]
+met[,sum_dens := sum(dens),by = c("mgroups","stroma_cluster")]
+met[,frac_pgroups := sum_dens/.N ,by = "mgroups"]
+met = unique(met[,c("frac_pgroups","mgroups","stroma_cluster")])
+met = met[!is.na(mgroups),]
+
+#Order meaningful
+met$stroma_cluster = factor(met$stroma_cluster,levels = row_order(h_clusters_stroma))
+
+p2 = ggplot(met, aes(x = as.factor(mgroups), y = frac_pgroups, fill  = stroma_cluster)) + 
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = scols[order(match(cluster, as.numeric(as.character(levels(met$stroma_cluster))))),]$stroma_cols)+
+  ggtitle("Met")
+
+p1 + p2
+
+```
+
+Correlations of non-epithelial cells within primary tumors or LN mets and between them (densities)
+```{r correlations non-epithelial primary met}
+#Cluster densities in primary tumors
+primary = as.data.table(data.frame(colData(subset(sce_s,,TissueType == "primary tumor"))[c('PID','core','stroma_cluster',"sizeflag","AreaTissue")],id = colnames(subset(sce_s,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('core', 'stroma_cluster')]
+primary[,test := .N,by = "core"]
+primary = primary[test >= 100,]
+primary[,tot_cluster := .N, by = "stroma_cluster"]
+nr_bars = unique(primary[,c("tot_cluster","stroma_cluster")])
+primary[,density_core := ncells/AreaTissue,by = c("core","stroma_cluster")]
+primary = unique(primary[,c("PID","core","stroma_cluster","density_core")])
+primary[,density_PID := mean(density_core),by = c("PID","stroma_cluster")]
+primary = unique(primary[,c("PID","density_PID","stroma_cluster")])
+primary = dcast.data.table(primary,"PID ~ stroma_cluster",value.var = "density_PID",fill = 0)
+
+#Order according to cluster similarity
+primary = primary[,c("PID",row_order(h_clusters_stroma)),with = F]
+
+#Calculate correlations within primaries
+crosscor = cor(primary[,-"PID"],method = "pearson")
+
+#Order number cells in cluster bars accordingly
+nr_bars = nr_bars[order(match(stroma_cluster,row_order(h_clusters_stroma))),]
+
+#clustered heatmap
+ha_prim = HeatmapAnnotation(tumor = colnames(crosscor),
+    col = list(tumor = structure(scols$stroma_cols,names = scols$cluster)))
+t_primary_clustered = rowAnnotation(axis_reverse = anno_barplot(nr_bars$tot_cluster,axis_param = list(direction = "reverse"), width = unit(20, "mm"))) +
+  Heatmap(crosscor, name = "correlation",column_title = "stroma primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_prim)+
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+t_primary_clustered
+  
+#Heatmap ordered according to cluster similarity
+t_primary = rowAnnotation(axis_reverse = anno_barplot(nr_bars$tot_cluster,axis_param = list(direction = "reverse"), width = unit(20, "mm"))) +
+  Heatmap(crosscor, name = "correlation",column_title = "stroma primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,cluster_columns = F,top_annotation = ha_prim)+
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+t_primary
+
+
+#Cluster densities in LN mets
+met = as.data.table(data.frame(colData(subset(sce_s,,TissueType == "lymph node mts"))[c('PID','core','stroma_cluster',"sizeflag","AreaTissue")],id = colnames(subset(sce_s,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('core', 'stroma_cluster')]
+met[,test := .N,by = "core"]
+met = met[test >= 100,]
+met[,tot_cluster := .N, by = "stroma_cluster"]
+nr_bars = unique(met[,c("tot_cluster","stroma_cluster")])
+met[,density_core := ncells/AreaTissue,by = c("core","stroma_cluster")]
+met = unique(met[,c("PID","core","stroma_cluster","density_core")])
+met[,density_PID := mean(density_core),by = c("PID","stroma_cluster")]
+met = unique(met[,c("PID","density_PID","stroma_cluster")])
+met = dcast.data.table(met,"PID ~ stroma_cluster",value.var = "density_PID",fill = 0)
+
+#Order according to cluster similarity
+met = met[,c("PID",row_order(h_clusters_stroma)),with = F]
+
+#Correlations within LN mets
+crosscor = cor(met[,-"PID"],method = "pearson")
+crosscor[is.na(crosscor)] = 0
+
+#Order bars accordingly
+nr_bars = nr_bars[order(match(stroma_cluster,row_order(h_clusters_stroma))),]
+
+#Clustered heatmap
+ha_met = HeatmapAnnotation(tumor = colnames(crosscor),
+    col = list(tumor = structure(scols$stroma_cols,names = scols$cluster)))
+t_met_clustered = rowAnnotation(axis_reverse = anno_barplot(nr_bars$tot_cluster,axis_param = list(direction = "reverse"), width = unit(20, "mm"))) +
+  Heatmap(crosscor, name = "correlation",column_title = "tumor met", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_met)+
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+t_met_clustered
+
+#Heatmap ordered according to cluster similarity
+t_met = Heatmap(crosscor, name = "correlation",column_title = "tumor met", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,cluster_columns = F,top_annotation = ha_met)+
+  rowAnnotation(rn = anno_text(rownames(crosscor)))+
+  rowAnnotation(axis_reverse = anno_barplot(nr_bars$tot_cluster, width = unit(20, "mm")))
+t_met
+
+
+#Combine primary and LN met for matched cases
+primary = primary[PID %in% met$PID,]
+met = met[PID %in% primary$PID,]
+
+#Order according to cluster similarity
+primary = primary[,c("PID",row_order(h_clusters_stroma)),with = F]
+met = met[,c("PID",row_order(h_clusters_stroma)),with = F]
+
+#Correlations between primary and matched LN met
+crosscor = cor(primary[,-"PID"],met[,-"PID"])
+crosscor[is.na(crosscor)] = 0
+
+#Clustered heatmap
+ha_mix = HeatmapAnnotation(tumor = colnames(crosscor),
+    col = list(tumor = structure(scols$stroma_cols,names = scols$cluster)))
+t_met_prim_clustered = Heatmap(crosscor, name = "correlation",column_title = "stroma met primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_mix)+
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+t_met_prim_clustered
+
+#Heatmap ordered according to cluster similarity
+t_met_prim = Heatmap(crosscor, name = "correlation",column_title = "stroma met primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,cluster_columns = F,top_annotation = ha_mix)+
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+
+#Plot side by side
+t_primary + t_met_prim + t_met
+
+```
+
+Correlations between tumor and non-epithelial cells within primary tumors or LN mets and between them (densities)
+```{r correlations  tumor and non-epithelial primary met}
+#Primary stroma densities
+stroma = as.data.table(data.frame(colData(subset(sce_s,,TissueType == "primary tumor"))[c('PID','core','stroma_cluster',"sizeflag","AreaTissue")],id = colnames(subset(sce_s,,TissueType == "primary tumor"))))
+stroma = stroma[sizeflag != 1,]
+stroma[,ncells:=.N ,by= c('core', 'stroma_cluster')]
+stroma[,test := .N,by = "core"]
+stroma = stroma[test >=100,]
+stroma[,tot_cluster := .N, by = "stroma_cluster"]
+nr_bars_s = unique(stroma[,c("tot_cluster","stroma_cluster")])
+stroma[,density_core := ncells/AreaTissue,by = c("core","stroma_cluster")]
+stroma = unique(stroma[,c("PID","core","stroma_cluster","density_core")])
+stroma[,density_PID := mean(density_core),by = c("PID","stroma_cluster")]
+stroma = unique(stroma[,c("PID","density_PID","stroma_cluster")])
+stroma = dcast.data.table(stroma,"PID ~ stroma_cluster",value.var = "density_PID",fill = 0)
+
+#Primary tumor densities
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100',"sizeflag","AreaTissue")],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('core', 'tumor_cluster_100')]
+primary[,test :=.N,by = "core"]
+primary = primary[test >=100,]
+primary[,tot_cluster := .N, by = "tumor_cluster_100"]
+nr_bars = unique(primary[,c("tot_cluster","tumor_cluster_100")])
+primary[,density_core := ncells/AreaTissue,by = c("core","tumor_cluster_100")]
+primary = unique(primary[,c("PID","core","tumor_cluster_100","density_core")])
+primary[,density_PID := mean(density_core),by = c("PID","tumor_cluster_100")]
+primary = unique(primary[,c("PID","density_PID","tumor_cluster_100")])
+primary = dcast.data.table(primary,"PID ~ tumor_cluster_100",value.var = "density_PID",fill = 0)
+
+#Exclude not matched samples
+primary = primary[PID %in% stroma$PID,]
+stroma = stroma[PID %in% primary$PID,]
+
+#Order according to cluster similarities
+primary = primary[,c("PID",order_tumor$V1),with = F]
+stroma = stroma[,c("PID",order_stroma$V1),with = F]
+
+#Correlation between stromal and tumor cells in primaries
+crosscor = cor(stroma[,-"PID"],primary[,-"PID"])
+
+#Order bars accordingly
+nr_bars_s = nr_bars_s[order(match(stroma_cluster,rownames(crosscor))),]
+nr_bars = nr_bars[order(match(tumor_cluster_100,colnames(crosscor))),]
+
+#Heatmap
+ha = HeatmapAnnotation(bars = anno_barplot(nr_bars$tot_cluster, width = unit(20, "mm")),tumor = colnames(crosscor),col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+ts_primary = Heatmap(crosscor, name = "correlation",column_title = "tumor stroma primary", km = 1, col = colorRamp2(c(-1,0, 1), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha)+
+  Heatmap(rownames(crosscor), name = "stroma", show_row_names = T, width = unit(10, "mm"), col = structure(scols$stroma_cols,names = scols$cluster))+
+  rowAnnotation(rn = anno_text(rownames(crosscor)))+
+  rowAnnotation(axis_reverse = anno_barplot(nr_bars_s$tot_cluster, width = unit(20, "mm")))
+ts_primary
+
+#Save column order to order other heatmaps according to this one
+order_columns = colnames(crosscor)[column_order(ts_primary)$correlation]
+
+
+#LN met stroma densities
+stroma = as.data.table(data.frame(colData(subset(sce_s,,TissueType == "lymph node mts"))[c('PID','core','stroma_cluster',"sizeflag","AreaTissue")],id = colnames(subset(sce_s,,TissueType == "lymph node mts"))))
+stroma = stroma[sizeflag != 1,]
+stroma[,ncells:=.N ,by= c('core', 'stroma_cluster')]
+stroma[,test := .N,by = "core"]
+stroma = stroma[test >=100,]
+stroma[,tot_cluster := .N, by = "stroma_cluster"]
+nr_bars_s = unique(stroma[,c("tot_cluster","stroma_cluster")])
+stroma[,density_core := ncells/AreaTissue,by = c("core","stroma_cluster")]
+stroma = unique(stroma[,c("PID","core","stroma_cluster","density_core")])
+stroma[,density_PID := mean(density_core),by = c("PID","stroma_cluster")]
+stroma = unique(stroma[,c("PID","density_PID","stroma_cluster")])
+stroma = dcast.data.table(stroma,"PID ~ stroma_cluster",value.var = "density_PID",fill = 0)
+
+#LN met tumor densities
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100',"sizeflag","AreaTissue")],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('core', 'tumor_cluster_100')]
+primary[,test := .N,by = "core"]
+primary = primary[test >=100,]
+primary[,tot_cluster := .N, by = "tumor_cluster_100"]
+nr_bars = unique(primary[,c("tot_cluster","tumor_cluster_100")])
+primary[,density_core := ncells/AreaTissue,by = c("core","tumor_cluster_100")]
+primary = unique(primary[,c("PID","core","tumor_cluster_100","density_core")])
+primary[,density_PID := mean(density_core),by = c("PID","tumor_cluster_100")]
+primary = unique(primary[,c("PID","density_PID","tumor_cluster_100")])
+primary = dcast.data.table(primary,"PID ~ tumor_cluster_100",value.var = "density_PID",fill = 0)
+
+#Exclude not matched samples
+primary = primary[PID %in% stroma$PID,]
+stroma = stroma[PID %in% primary$PID,]
+
+#Order
+primary = primary[,c("PID",order_tumor$V1[order_tumor$V1 %in% colnames(primary)]),with = F]
+stroma = stroma[,c("PID",order_stroma$V1[order_stroma$V1 %in% colnames(stroma)]),with = F]
+
+#Correlations between stromal and tumor cells in LN mets
+crosscor = cor(stroma[,-"PID"],primary[,-"PID"])
+
+#Order bars accordingly
+nr_bars_s = nr_bars_s[order(match(stroma_cluster,rownames(crosscor))),]
+nr_bars = nr_bars[order(match(tumor_cluster_100,colnames(crosscor))),]
+
+#Order according to above columns
+crosscor = crosscor[,order_columns[order_columns != "16"]]
+
+#Heatmap
+ha = HeatmapAnnotation(bars = anno_barplot(nr_bars$tot_cluster, width = unit(20, "mm")),tumor = colnames(crosscor),col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+ts_met = Heatmap(crosscor, name = "correlation",column_title = "tumor stroma met", km = 1, col = colorRamp2(c(-1,0, 1), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",cluster_columns = F,top_annotation = ha)+
+  Heatmap(rownames(crosscor), name = "stroma", show_row_names = T, width = unit(10, "mm"), col = structure(scols$stroma_cols,names = scols$cluster))+
+  rowAnnotation(rn = anno_text(rownames(crosscor)))+
+  rowAnnotation(axis_reverse = anno_barplot(nr_bars_s$tot_cluster, width = unit(20, "mm")))
+ts_primary + ts_met
+
+```
+
+Paired differential abundance analysis of non-epithelial clusters between matched primary and LN met samples
+```{r differential abundance}
+#Extract relevant information for primary tumor and LN met samples
+both = as.data.table(data.frame(colData(subset(sce_s,,TissueType %in% c("primary tumor","lymph node mts")))[c('TissueType','PID','core','stroma_cluster','sizeflag')],id = colnames(subset(sce_s,,TissueType %in% c("primary tumor","lymph node mts")))))
+
+#Exclude sizeflagged cells
+both = both[sizeflag != 1,]
+
+#Only use samples with matched primary and LN met tissue
+both[,test:= length(unique(TissueType)),by = "PID"]
+both = both[test == 2,]
+
+#Calculate number of cells from each cluster in primary and LN met sample of each patient
+both[,ncells:=.N ,by= c('PID','TissueType', 'stroma_cluster')]
+both = unique(both[,c('stroma_cluster','ncells','PID','TissueType')])
+
+#Prepare data for differential abundance analysis using edgeR
+both = dcast.data.table(both, 'PID + TissueType ~ stroma_cluster',value.var = 'ncells',fill = 0)
+both$TissueType = factor(both$TissueType,levels =c("primary tumor","lymph node mts"))
+both$PID = factor(both$PID)
+
+#Create design matrix
+design <- createDesignMatrix(
+  both[,c("PID","TissueType")], cols_design = c( "PID","TissueType")
+)
+
+#Create contrast
+contrast <- createContrast(c(rep(0, ncol(design)-1),1))
+
+#Check contrast
+data.frame(parameters = colnames(design), contrast)
+
+#Normalize
+norm_factors <- calcNormFactors(t(both[,-c("PID","TissueType")]), method = "TMM")
+
+#Differential abundance
+y <- DGEList(t(both[,-c("PID","TissueType")]), norm.factors = norm_factors)
+y <- estimateDisp(y,design)
+
+fit <- glmFit(y, design)
+lrt <- glmLRT(fit, contrast = contrast)
+top <- edgeR::topTags(lrt, n = Inf, adjust.method = "BH", 
+        sort.by = "none")
+
+#Write out result table
+res = as.data.table(top$table)
+res$cluster = rownames(top$table)
+res$sign = 0
+res$sign[res$FDR < 0.01] = 1
+res = res[order(FDR)]
+
+cols = scols[cluster %in% res[sign ==1,]$cluster,]
+res$cols = "black"
+res[sign ==1,]$cols = cols[order(match(cluster,res[sign ==1,]$cluster)),]$stroma_cols
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/DA_paired_color_stroma.pdf",height = 3)
+ggplot(res,aes(x = logCPM,y = logFC,colour = ifelse(sign == 1,cluster,"non-sign")))+ geom_point(size = 3,alpha = 1) +scale_colour_manual(values = c(res[order(cluster)]$cols[res[order(cluster)]$cols != "black"], "black"))+theme_bw()
+dev.off()
+
+#Plot logFC of significant clusters
+res = res[sign == 1,]
+res[logFC > 0,posneg := "pos"]
+res[logFC < 0,posneg := "neg"]
+res = res[order(logFC)]
+res[,cluster := factor(cluster,levels = cluster)]
+
+ggplot(res,aes(y = cluster, x = logFC, fill = posneg))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = c("lightblue","purple"))
+
+ggplot(res,aes(y = cluster, x = logFC, fill = cluster))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = scols[order(match(cluster,res$cluster))]$stroma_cols)
+
+```
+
+Survival model on non-epithelial cluster densities in LN mets
+```{r survival densities LN mets}
+#LN met non-epithelial cluster densities
+met = as.data.table(data.frame(colData(subset(sce_s,,TissueType == "lymph node mts"))[c('PID','core','stroma_cluster','sizeflag',"AreaTissue")],id = colnames(subset(sce_s,,TissueType == "lymph node mts"))))
+#Exclude shitty images and cells
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('core', 'stroma_cluster')]
+met[,test := .N,by = "core"]
+met = met[test >=100,]
+met[,density_core := ncells/AreaTissue,by = c("core","stroma_cluster")]
+met = unique(met[,c("PID","core","stroma_cluster","density_core")])
+met[,density_PID := mean(density_core),by = c("PID","stroma_cluster")]
+met = unique(met[,c("PID","density_PID","stroma_cluster")])
+met = dcast.data.table(met,"PID ~ stroma_cluster",value.var = "density_PID",fill = 0)
+
+#Change Unit so the density values are well above 1 (setting zeros to 1 after so they will be zeros again after log, zeros represent complete absence of a community type -> should stay zero)
+met = cbind(met[,"PID",with = F],data.table(as.matrix(met[,-"PID",with = F]) * 10000000))
+
+#Log transform density values
+bin = met[,-"PID",with = F]
+bin = log1p(bin)
+# bin[bin == 0] = 1
+# bin = log(bin)
+met = cbind(met[,"PID",with = F],bin)
+colnames(met)[colnames(met) != "PID"] = paste0('cluster_',colnames(met)[colnames(met) != "PID"])
+
+#Add survival info and clinical classifications
+surv_dat = unique(as.data.table(colData(sce_s)[,c('OSfinal','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OSfinal),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+add = unique(as.data.table(colData(subset(sce_s,,TissueType == "primary tumor"))[,c("PID","Grade","Mol_Signature","pN_4gr")]))
+add$Mol_Signature[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$Mol_Signature[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add = unique(add)
+surv_dat = merge(surv_dat,add,by = "PID",all.x = T)
+surv_dat = merge(surv_dat,met,by = "PID")
+
+#Clean and set reference level for nodal status
+surv_dat[pN_4gr == "pN0",pN_4gr := "#NULL!"]#looking at LN met samples only
+surv_dat[is.na(pN_4gr),pN_4gr := "#NULL!"]
+surv_dat[pN_4gr == "7",pN_4gr := "#NULL!"]
+surv_dat[,pN_4gr := factor(pN_4gr,levels = c("pN1","pN2","pN3","#NULL!"))]
+
+#Clean and set reference level for grade
+surv_dat[is.na(Grade),Grade := "#NULL!"]
+surv_dat[Grade == "4",Grade := "#NULL!"]
+surv_dat[,Grade := factor(Grade,levels = c("G3","G2","G1","#NULL!"))]
+
+#Clean and set reference level for molecular subtype
+surv_dat[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+surv_dat[,Mol_Signature := factor(Mol_Signature,levels = c("Luminal A","Luminal B (HER2-)","Luminal B (HER2+)","HER2","Triple negative","#NULL!"))]
+
+#Calculate coxph model
+res.cox2 <- coxph(Surv(surv_dat$OSfinal, surv_dat$censoring) ~ ., data =  surv_dat[,-c("PID","TissueType","OSfinal","Livestatus1censored","censoring")])
+summary(res.cox2)
+
+#Extract model output
+td_coef = as.data.table(tidy(res.cox2,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = sub("cluster_","",td_coef$term)
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Add color map with black for clinical classifications
+cur_cols = rbind(scols,data.table(stroma_cols = rep("black",length(c(unique(surv_dat$Grade),unique(surv_dat$Mol_Signature),unique(surv_dat$pN_4gr)))),cluster = c(paste0("Grade",unique(surv_dat$Grade)),paste0("Mol_Signature",unique(surv_dat$Mol_Signature)),paste0("pN_4gr",unique(surv_dat$pN_4gr)))))
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate, color = term)) +
+geom_point(size = 2) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+scale_color_manual(values = cur_cols[order(match(cluster,levels(td_coef$term))),]$stroma_cols)+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')+
+theme(axis.text.y = element_text(color = cur_cols[order(match(cluster,levels(td_coef$term))),]$stroma_cols))
+
+```
+
+Survival model on non-epithelial cluster densities in primary tumors
+```{r survival densities primaries}
+#Primary tumor non-epithelial cluster densities
+primary = as.data.table(data.frame(colData(subset(sce_s,,TissueType == "primary tumor"))[c('PID','core','stroma_cluster','sizeflag',"AreaTissue")],id = colnames(subset(sce_s,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('core', 'stroma_cluster')]
+primary[,test := .N,by = "core"]
+primary = primary[test >=100,]
+primary[,density_core := ncells/AreaTissue,by = c("core","stroma_cluster")]
+primary = unique(primary[,c("PID","core","stroma_cluster","density_core")])
+primary[,density_PID := mean(density_core),by = c("PID","stroma_cluster")]
+primary = unique(primary[,c("PID","density_PID","stroma_cluster")])
+primary = dcast.data.table(primary,"PID ~ stroma_cluster",value.var = "density_PID",fill = 0)
+
+#Change Unit so the density values are well above 1 (setting zeros to 1 after so they will be zeros again after log, zeros represent complete absence of a community type -> should stay zero)
+primary = cbind(primary[,"PID",with = F],data.table(as.matrix(primary[,-"PID",with = F]) * 10000000))
+
+#log transform density values
+bin = primary[,-"PID",with = F]
+bin = log1p(bin)
+# bin[bin == 0] = 1
+# bin = log(bin)
+primary = cbind(primary[,"PID",with = F],bin)
+
+#Get survival info and clinical classes
+surv_dat = unique(as.data.table(colData(sce_s)[,c('OSfinal','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OSfinal),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+add = unique(as.data.table(colData(subset(sce_s,,TissueType == "primary tumor"))[,c("PID","Grade","Mol_Signature","pN_4gr")]))
+add$Mol_Signature[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$Mol_Signature[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add = unique(add)
+surv_dat = merge(surv_dat,add,by = "PID",all.x = T)
+colnames(primary)[colnames(primary) != "PID"] = paste0('cluster_',colnames(primary)[colnames(primary) != "PID"])
+surv_dat = merge(surv_dat,primary,by = "PID")
+
+#Clean and set reference level for nodal status
+surv_dat[is.na(pN_4gr),pN_4gr := "#NULL!"]
+surv_dat[pN_4gr == "7",pN_4gr := "#NULL!"]
+surv_dat[,pN_4gr := factor(pN_4gr,levels = c("pN0","pN1","pN2","pN3","#NULL!"))]
+
+#Clean and set reference level for grade
+surv_dat[is.na(Grade),Grade := "#NULL!"]
+surv_dat[Grade == "4",Grade := "#NULL!"]
+surv_dat[,Grade := factor(Grade,levels = c("G3","G2","G1","#NULL!"))]
+
+#Clean and set reference level for molecular subtype
+surv_dat[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+surv_dat[,Mol_Signature := factor(Mol_Signature,levels = c("Luminal A","Luminal B (HER2-)","Luminal B (HER2+)","HER2","Triple negative","#NULL!"))]
+
+res.cox2 <- coxph(Surv(surv_dat$OSfinal, surv_dat$censoring) ~ ., data =  surv_dat[,-c("PID","TissueType","OSfinal","Livestatus1censored","censoring")])
+summary(res.cox2)
+
+#Extract model output
+td_coef = as.data.table(tidy(res.cox2,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = sub("cluster_","",td_coef$term)
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+cur_cols = rbind(scols,data.table(stroma_cols = rep("black",length(c(unique(surv_dat$Grade),unique(surv_dat$Mol_Signature),unique(surv_dat$pN_4gr)))),cluster = c(paste0("Grade",unique(surv_dat$Grade)),paste0("Mol_Signature",unique(surv_dat$Mol_Signature)),paste0("pN_4gr",unique(surv_dat$pN_4gr)))))
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate, color = term)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+scale_color_manual(values = cur_cols[order(match(cluster,levels(td_coef$term))),]$stroma_cols)+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')+
+theme(axis.text.y = element_text(color = cur_cols[order(match(cluster,levels(td_coef$term))),]$stroma_cols))
+
+```
+
+Check tumor microenvironment composition in more or less heterogeneous LN mets
+```{r}
+#Calculate cluster numbers in LN mets and overall heterogeneity (as in pipeline 2)
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=100,]
+met = unique(met[,c("PID","tumor_cluster_100","ncells")])
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",fill =0)
+met$entropy = apply(as.matrix(met[,-"PID"]),1,entropy.ChaoShen)
+met = unique(met[,c("PID","entropy")])
+met[,grp := "low"]
+met[entropy > quantile(entropy,0.25),grp := "mid"]
+met[entropy > quantile(entropy,0.75),grp := "high"]
+
+
+#Combine with non-epithelial clusters
+str = as.data.table(colData(subset(sce_s,,TissueType = "lymph node mts"))[,c("PID","stroma_cluster")])
+str$id = colnames(sce_s)
+str = str[!is.na(PID),]
+str[,ncells := .N, by = c("PID","stroma_cluster")]
+str[,frac_PID := ncells/.N, by = "PID"]
+str = unique(str[,c("PID","stroma_cluster","frac_PID")])
+
+str = merge(str,met,by = "PID")
+str[,grp := factor(grp,levels = c("low","mid","high"))]
+
+ggplot(str,aes(x = stroma_cluster,y = frac_PID,fill = grp))+
+  geom_boxplot()
+```

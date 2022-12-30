@@ -1,0 +1,3842 @@
+---
+title: "Analysis_pipeline2"
+author: "Jana Fischer"
+date: "2/27/2020"
+output: html_document
+---
+
+Comparison of tumor cells between primary tumors and LN mets
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+library(data.table)
+library(SingleCellExperiment)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(scater)
+library(stringr)
+library(viridis)
+library(ggrastr)
+library(plyr)
+library(diffcyt)
+library(edgeR)
+library(glmnet)
+library(factoextra)
+library(survival)
+library(broom)
+library(patchwork)
+library(ggalluvial)
+library(entropy)
+library(ggpubr)
+```
+
+Prepare frequently used color maps and define tumor markers
+```{r prepare}
+#Set global seed
+set.seed(3)
+
+#Define general color map of distinguishable colors
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+col_vector = unique(col_vector)
+
+#Read in colormaps for the frequently used metadata
+cols_mol = fread("/mnt/ZTMA_21_25_26/analysis/cols_mol.csv",header = T)
+cols_grade = fread("/mnt/ZTMA_21_25_26/analysis/cols_grade.csv",header = T)
+cols_pN_4gr = fread("/mnt/ZTMA_21_25_26/analysis/cols_pN_4gr.csv",header = T)
+cols_tissue = fread("/mnt/ZTMA_21_25_26/analysis/cols_tissue",header = T)
+tcols = fread('/mnt/ZTMA_21_25_26/analysis/tcols.csv',header = T)
+pcols = fread('/mnt/ZTMA_21_25_26/analysis/pcols.csv',header = T)
+mcols = fread('/mnt/ZTMA_21_25_26/analysis/mcols.csv',header = T)
+
+#Define markers to use for clustering on tumor cells only
+tumor_channels = c("Dy161_Androgen Receptor AR","Dy163_GATA3","Er166_Carbonic Anhydrase IX","Er167_E-Cadherin / P-Cadherin","Er168_Ki-67","Eu151_c-erbB-2 - Her2","Gd156_Estrogen Receptor Alpha","Gd158_Progesterone Receptor A/B","Lu175_Keratin Epithelial","Nd144_Cytokeratin 8/18","Nd145_CD15","Nd150_c-Myc","Pr141_Cytokeratin 5","Sm147_Keratin 14 (KRT14)","Tb159_p53","Tm169_EGFR","Yb173_mTOR","Yb174_Cytokeratin 7","Yb176_Cleaved Caspase3")
+
+```
+
+Subcluster tumor cells with markers of interest
+```{r subcluster tumor cells,eval = F}
+#Read in sce with PG clustering from pipeline1
+sce = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_PG.rds')
+
+#Pick PG clusters containing tumor cells based on gaussian mixture model majority vote and manual curation based on heatmap generated at the end of pipeline1
+tumor = as.numeric(as.character(unique(sce$PG_clusters)))[!as.numeric(as.character(unique(sce$PG_clusters))) %in% c(60,59,126,115,82,26,16,125,11,70,36,103,44,42,61,34)]
+
+#Create a subset sce that includes only the tumor cells
+sce_t <- subset(sce, , PG_clusters %in% tumor)
+
+#Run PG on tumor cells only with defined markers of interest
+rpheno_out = cytofkit::Rphenograph(t(counts(sce_t[tumor_channels,])), k = 100, seed = 3, approx=T)
+sce_t$tumor_cluster_100 = as.factor(igraph::membership(rpheno_out))
+
+#Save tumor SCE with PG info
+saveRDS(sce_t, file = '/mnt/ZTMA_21_25_26/analysis/SCE_T.rds', ascii = FALSE)
+
+```
+
+Plot heatmap of tumor clusters and assign cluster colors
+```{r heatmap tumor clusters}
+#Read in tumor sce with tumor subclustering info from above already included
+sce_t = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_T.rds')
+
+#Prepare data for heatmap of markers used for clustering
+sum = sumCountsAcrossCells(sce_t[tumor_channels,],average = T,colData(sce_t[tumor_channels,])$tumor_cluster_100, exprs_values = "counts")
+p_dat = scale(t(sum))
+p_dat[p_dat > 3] =3
+p_dat[p_dat < -3] =-3
+
+#Prepare data for heatmap of additional markers (not used in clustering but still nice to visualize)
+channels_interest = rownames(sce_t)[!rownames(sce_t) %in% c(tumor_channels,"Ir193_Iridium","Yb172_vWF","Yb171_CD4","Ho165_CD8a","Dy162_CD45","Sm154_CD11c","Sm152_CD3", "Dy164_CD20","Nd143_HLA-DR","Nd146_CD68")]
+sum = sumCountsAcrossCells(sce_t[channels_interest,],average = T,colData(sce_t[tumor_channels,])$tumor_cluster_100, exprs_values = "counts")
+p_dat_side = scale(t(sum))
+p_dat_side[p_dat_side > 3] =3
+p_dat_side[p_dat_side < -3] =-3
+
+#Prepare data for heatmap of spatial single-cell features
+spatial = as.data.table(colData(sce_t)[c('Neighbors_NumberOfNeighbors_4','Neighbors_PercentTouching_4', "AreaShape_Area", "tumor_cluster_100")])
+spatial = aggregate(spatial[,-"tumor_cluster_100"],by = list(tumor_cluster_100 = spatial$tumor_cluster_100),FUN = mean)
+rnames = spatial$tumor_cluster_100
+spatial = as.matrix(spatial[,colnames(spatial)[colnames(spatial) != "tumor_cluster_100"]])
+rownames(spatial) = rnames
+spatial = scale(spatial)
+
+#Calculate absolute number of cells in each cluster and fraction of cells of each tissue type
+nr = table(colData(sce_t)[c('tumor_cluster_100','TissueType')])
+fr_tissuetype = as.data.table(nr)
+nr = rowSums(nr)
+fr_tissuetype[,fr := N/sum(N),by = "tumor_cluster_100"]
+fr_tissuetype = dcast.data.table(fr_tissuetype,"tumor_cluster_100 ~ TissueType", value.var = "fr")
+rnames = fr_tissuetype$tumor_cluster_100
+fr_tissuetype=as.matrix(fr_tissuetype[,-"tumor_cluster_100"])
+rownames(fr_tissuetype) = rnames
+fr_tissuetype = fr_tissuetype[order(as.numeric(rownames(fr_tissuetype))),]
+
+#Calculate fraction of cells from each molecular subtype in each cluster to visualize as bubble plot
+bubble = as.data.table(colData(sce_t)[c('tumor_cluster_100','Mol_Signature','TissueType')])
+bubble = bubble[!is.na(Mol_Signature),]
+bubble[TissueType != "primary tumor",Mol_Signature := "Non primary"]
+bubble[,both := .N, by=c('tumor_cluster_100','Mol_Signature')]
+bubble[,frac_subcluster := both/.N ,by = 'tumor_cluster_100']
+bubble[,frac_type := both/.N ,by = 'Mol_Signature']
+bubble_size = unique(bubble[,c('tumor_cluster_100','Mol_Signature','frac_subcluster')])
+bubble_alpha = unique(bubble[,c('tumor_cluster_100','Mol_Signature','frac_type')])
+
+#As bubble size visualize fraction of cluster cells in molecular subtype
+bubble_size = dcast.data.table(bubble_size,'tumor_cluster_100 ~ Mol_Signature',value.var = 'frac_subcluster',fill= 0)
+rnames = bubble_size$tumor_cluster_100
+bubble_size = as.matrix(bubble_size[,-'tumor_cluster_100'])
+rownames(bubble_size) = rnames
+
+#As bubble alpha visualize fraction of molecular subtype cells in cluster
+bubble_alpha = dcast.data.table(bubble_alpha,'tumor_cluster_100 ~ Mol_Signature',value.var = 'frac_type',fill= 0)
+rnames = bubble_alpha$tumor_cluster_100
+bubble_alpha = as.matrix(bubble_alpha[,-'tumor_cluster_100'])
+rownames(bubble_alpha) = rnames
+
+#Define color map for bubbles
+col_fun = circlize::colorRamp2(c(0, max(bubble_alpha)), c("lightblue", "darkblue"))
+
+#Plot heatmap
+h_clusters_tumor = Heatmap(p_dat, name = "clustered",column_title = "clustering markers", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  Heatmap(p_dat_side, name = "additional",column_title = "additional markers", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  Heatmap(spatial, name = "spatial",column_title = "spatial", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  rowAnnotation(axis_reverse = anno_barplot(fr_tissuetype, width = unit(20, "mm"),gp = gpar(fill = 2:7, col = 2:7)))+
+  rowAnnotation(axis_reverse = anno_barplot(nr, width = unit(20, "mm"),gp = gpar(fill = 2:7, col = 2:7)))+
+  rowAnnotation(rn = anno_text(rownames(p_dat)))+
+    Heatmap(bubble_alpha, name = "bubbles", col = col_fun, rect_gp = gpar(type = "none"), 
+            cell_fun = function(j, i, x, y, width, height, fill) {
+              grid.circle(x = x, y = y, r = abs((bubble_size[i, j])*2) * min(unit.c(width, height)), 
+                          gp = gpar(fill = col_fun(bubble_alpha[i, j]), col = NA))
+          },show_row_names = F)
+h_clusters_tumor
+
+
+#Define colors for the tumor clusters
+tumor_cols = c(colors()[grep("mediumpurple",colors())][c(1,3)],colors()[grep("purple",colors())][c(5)],
+  colors()[grep("orange",colors())][12:15],
+  colors()[grep("violet",colors())][4],
+  colors()[grep("orange",colors())][c(1:5,9:11)],
+  colors()[grep("red",colors())][3:5],
+  colors()[grep("dodgerblue",colors())][1:4],
+  colors()[grep("deeppink",colors())][c(1,3)],
+  colors()[grep("purple",colors())][4],
+  colors()[grep("violet",colors())][1:3],
+  colors()[grep("purple",colors())][1:3],
+  colors()[grep("orange",colors())][7:8],
+  colors()[grep("hotpink",colors())][1:4],
+  colors()[grep("cyan",colors())][2],
+  colors()[grep("red",colors())][1:2],
+  colors()[grep("turquoise",colors())][1:5],
+  colors()[grep("royalblue",colors())][4:5],
+  colors()[grep("cyan",colors())][1],
+  colors()[grep("blue",colors())][6],
+  colors()[grep("orange",colors())][6],
+  colors()[grep("blue",colors())][5],
+  colors()[grep("pink",colors())][16:17],
+  colors()[grep("lightpink",colors())][1:5]
+  )#low bottom
+
+tumor_cols = tumor_cols[order(row_order(h_clusters_tumor))]
+tcols = as.data.table(tumor_cols)
+tcols$cluster = 1:59
+
+#Save out tumor cluster colors
+fwrite(tcols,'/mnt/ZTMA_21_25_26/analysis/tcols.csv',col.names = T)
+fwrite(as.data.table(row_order(h_clusters_tumor)),'/mnt/ZTMA_21_25_26/analysis/order_tumor.csv',col.names = T)
+
+#Plot heatmap with tumor cell cluster colorbar
+h_clusters_tumor = Heatmap(p_dat, name = "clustered",column_title = "clustering markers", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+ #,split= 14
+  Heatmap(tcols$cluster, name = "cols", show_row_names = F, width = unit(10, "mm"), col = tcols$tumor_cols)+
+  Heatmap(p_dat_side, name = "additional",column_title = "additional markers", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  Heatmap(spatial, name = "spatial",column_title = "spatial", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  rowAnnotation(fractions = anno_barplot(fr_tissuetype, width = unit(20, "mm"),gp = gpar(fill = cols_tissue[order(match(TissueType,colnames(fr_tissuetype))),]$col, col = cols_tissue[order(match(TissueType,colnames(fr_tissuetype))),]$col)))+
+  rowAnnotation(absNr = anno_barplot(nr, width = unit(20, "mm"),gp = gpar(fill = "grey", col = "black")))+
+  rowAnnotation(rn = anno_text(rownames(p_dat)))+
+    Heatmap(bubble_alpha, name = "bubbles", col = col_fun, rect_gp = gpar(type = "none"), 
+          cell_fun = function(j, i, x, y, width, height, fill) {
+              grid.circle(x = x, y = y, r = abs((bubble_size[i, j])*3) * min(unit.c(width, height)), 
+                          gp = gpar(fill = col_fun(bubble_alpha[i, j]), col = NA))
+          },show_row_names = F)
+h_clusters_tumor
+
+#Save out cophenetic distances between clusters for a later pipeline
+dend_tumor = row_dend(h_clusters_tumor)
+dend_dist = as.matrix(cophenetic(dend_tumor))
+write.csv(dend_dist,"/mnt/ZTMA_21_25_26/analysis/cophenetic_dist.csv",row.names = T)
+
+#Prettier versiom of the bubble plot separately
+p = unique(bubble[,c("tumor_cluster_100","Mol_Signature","frac_subcluster","frac_type")])
+p$tumor_cluster_100 = factor(p$tumor_cluster_100, levels = rev(rownames(p_dat)[row_order(h_clusters_tumor)]))
+p$Mol_Signature = factor(p$Mol_Signature, levels = c("HER2","Triple negative","Luminal B (HER2+)","#NULL!","Non primary","Luminal A","Luminal B (HER2-)"))
+
+ggplot(p,aes(x = Mol_Signature, y = tumor_cluster_100, alpha = ifelse(frac_subcluster==0, NA, frac_subcluster), size = ifelse(frac_type==0, NA, frac_type),color = tumor_cluster_100)) + geom_point()+
+  scale_color_manual(values = tcols[order(match(cluster, levels(p$tumor_cluster_100)))]$tumor_cols)+theme_minimal()+ scale_size_continuous(range = c(0.1, 10))
+```
+
+Metacluster into fewer clusters based on hierarchical clustering
+```{r metacluster}
+#Plot again but this time with a split into N metaclusters
+N = 14
+
+h_clusters_tumor_meta = Heatmap(p_dat, name = "clustered",column_title = "clustering markers", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",split= N)+ 
+  Heatmap(tcols$cluster, name = "cols", show_row_names = F, width = unit(10, "mm"), col = tcols$tumor_cols)+
+  Heatmap(p_dat_side, name = "additional",column_title = "additional markers", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  Heatmap(spatial, name = "spatial",column_title = "spatial", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+  rowAnnotation(fractions = anno_barplot(fr_tissuetype, width = unit(20, "mm"),gp = gpar(fill = cols_tissue[order(match(TissueType,colnames(fr_tissuetype))),]$col, col = cols_tissue[order(match(TissueType,colnames(fr_tissuetype))),]$col)))+
+  rowAnnotation(absNr = anno_barplot(nr, width = unit(20, "mm"),gp = gpar(fill = "grey", col = "black")))+
+  rowAnnotation(rn = anno_text(rownames(p_dat)))+
+    Heatmap(bubble_alpha, name = "bubbles", col = col_fun, rect_gp = gpar(type = "none"), 
+          cell_fun = function(j, i, x, y, width, height, fill) {
+              grid.circle(x = x, y = y, r = abs((bubble_size[i, j])*3) * min(unit.c(width, height)), 
+                          gp = gpar(fill = col_fun(bubble_alpha[i, j]), col = NA))
+          },show_row_names = F)
+h_clusters_tumor_meta
+
+#Extract metacluster mapping
+metaclusters = lapply(row_order(h_clusters_tumor_meta), function(x){rownames(p_dat)[x]})
+names(metaclusters) = 1:N
+n = sapply(1:N,function(x){rep(x,length(metaclusters[[x]]))})
+metaclusters = data.table(unlist(metaclusters))
+metaclusters$meta = unlist(n)
+names(metaclusters)[1] = 'tumor_cluster_100'
+
+#Add metaclusters to sce_t
+add = as.data.table(colData(sce_t)[,c("tumor_cluster_100")])
+add$id = colnames(sce_t)
+names(add) = c("tumor_cluster_100","id")
+add = merge(add,metaclusters,by = "tumor_cluster_100",all.x = T)
+add = add[order(match(id,colnames(sce_t))),]
+sce_t$metaclusters = add$meta
+
+#Define metacluster colors
+metacols = data.table()
+metacols$meta = 1:N
+metacols$col = c("pink1","dodgerblue1","deeppink","hotpink","blue4","darkred","mediumturquoise","paleturquoise1","royalblue4","indianred2","mediumpurple4","orangered1","darkorange","orange4")
+
+```
+
+Compare current tumor clusters to metaclusters of previous paper
+```{r compare to previous}
+#Heatmap of current tumor clusters
+sum = sumCountsAcrossCells(sce_t[tumor_channels,],average = T,colData(sce_t[tumor_channels,])$tumor_cluster_100, exprs_values = "counts")
+p_dat = scale(t(sum))
+p_dat[p_dat > 3] =3
+p_dat[p_dat < -3] =-3
+
+#Read in metacluster means from Basel TMA of previous paper
+hm_dat_basel = fread('/home/ubuntu/tmp/server_homes/janaf/Data/2019/Data_publication/ZurichTMA/output_BaselTMA/hm_dat_basel.csv',header = T)
+rownames = hm_dat_basel$V1
+hm_dat_basel = as.matrix(hm_dat_basel[,-1])
+rownames(hm_dat_basel)= rownames
+
+#Z-score Basel data
+hm_dat_basel = scale(hm_dat_basel)
+hm_dat_basel[hm_dat_basel > 3] =3
+hm_dat_basel[hm_dat_basel < -3] =-3
+
+#Make sure all the same marker names are used
+hm_dat_basel = hm_dat_basel[,c("1021522Tm169Di EGFR","1031747Er167Di ECadhe","112475Gd156Di Estroge","117792Dy163Di GATA3","1441101Er168Di Ki67","198883Yb176Di cleaved","201487Eu151Di cerbB","207736Tb159Di p53","234832Lu175Di panCyto","312878Gd158Di Progest","322787Nd150Di cMyc","346876Sm147Di Keratin","651779Pr141Di Cytoker","92964Er166Di Carboni","971099Nd144Di Cytoker","98922Yb174Di Cytoker","phospho mTOR")]
+colnames(hm_dat_basel) = c("Tm169_EGFR","Er167_E-Cadherin / P-Cadherin","Gd156_Estrogen Receptor Alpha","Dy163_GATA3","Er168_Ki-67","Yb176_Cleaved Caspase3","Eu151_c-erbB-2 - Her2","Tb159_p53","Lu175_Keratin Epithelial","Gd158_Progesterone Receptor A/B","Nd150_c-Myc","Sm147_Keratin 14 (KRT14)","Pr141_Cytokeratin 5","Er166_Carbonic Anhydrase IX","Nd144_Cytokeratin 8/18","Yb174_Cytokeratin 7","Yb173_mTOR")
+colnames(p_dat)[!colnames(p_dat) %in% colnames(hm_dat_basel)]
+p_dat = p_dat[,colnames(p_dat) %in% colnames(hm_dat_basel)]
+p_dat = p_dat[,colnames(hm_dat_basel)]
+
+#Combine current tumor clusters with tumor metaclusters from Basel TMA
+hm_dat_basel = hm_dat_basel[14:27,] #1:13 are stromal clusters in Basel TMA
+rownames(hm_dat_basel) = paste0("Metacluster_",rownames(hm_dat_basel))
+comb = rbind(p_dat,hm_dat_basel)
+
+#Metacluster colors from previous paper
+mycols_basel_meta <- colors()[c(258,257,86,85,259,81, #green
+                                652, #yellow
+                                636,520,430,109,68,43,#light blue
+                                132,#other dark blue
+                                26,#dark blue
+                                8,12, #turquouis
+                                33,#red
+                                551,#dark purple
+                                95,#light purple
+                                419,#light pink
+                                117,#pink
+                                52,#burnt orange
+                                500,#orange
+                                568,#pink orange
+                                624, #brown
+                                133)] #dark red
+
+#Plot combined heatmap
+h_comb = Heatmap(comb, name = "Combined",column_title = "Combined", km = 1, col = colorRamp2(c(-3,0, 3), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")+
+   Heatmap(rownames(comb), name = "Colors current tumor clusters", show_row_names = F, width = unit(10, "mm"), col = c(tcols[order(as.character(cluster)),]$tumor_cols,rep("gray",14)))+
+  Heatmap(rownames(comb), name = "Colors previous metaclusters", show_row_names = F, width = unit(10, "mm"), col = c(rep("gray",59),mycols_basel_meta[14:27]))+
+   rowAnnotation(rn = anno_text(rownames(comb)))
+h_comb
+
+```
+
+Run t-SNE and UMAP on tumor cells
+```{r run tSNE,eval = F}
+#In case this wasn't already set
+set.seed(3)
+
+#Define number of cores to use for parallelization
+require(doParallel)
+options('mc.cores' = 20)
+registerDoParallel(20)
+
+#Subsample 10% of cells from each core
+sub = colData(sce_t)[c('core')]
+sub$id = rownames(sub)
+sub = as.data.table(sub)
+sub = ddply(sub,.(core),function(x) x[sample(nrow(x),nrow(x)/10, replace = F),])
+sce_t_sub = sce_t[tumor_channels,sub$id]
+
+#Run umap and tsne
+sce_t_sub = runUMAP(sce_t_sub, exprs_values = "counts", n_neighbors = 25, min_dist = 0.5, external_neighbors=TRUE, BPPARAM = MulticoreParam())
+sce_t_sub = runTSNE(sce_t_sub, exprs_values = "counts", external_neighbors=TRUE, BPPARAM = MulticoreParam())
+
+#Save out subsampled tumor sce with dimensionality reduction info
+saveRDS(sce_t_sub, file = '/mnt/ZTMA_21_25_26/analysis/SCE_T_sub_dimRed.rds', ascii = FALSE)
+```
+
+Plot t-SNEs of tumor cells only
+```{r plot tSNE}
+#Read in subsampeled sce_t with dim red info already included
+sce_t_sub = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_T_sub_dimRed.rds')
+
+#Order factors according to color maps
+sce_t_sub$Mol_Signature = factor(sce_t_sub$Mol_Signature, levels = cols_mol$Mol_Signature)
+sce_t_sub$Grade = factor(sce_t_sub$Grade, levels = cols_grade$Grade)
+sce_t_sub$pN_4gr = factor(sce_t_sub$pN_4gr, levels = cols_pN_4gr$pN_4gr)
+sce_t_sub$TumorType = str_replace_all(sce_t_sub$TumorType, "[[:punct:]]", " ")
+
+#Dummy for shape
+sce_t_sub$dummy = 1
+
+#t-SNEs
+red = as.data.table(reducedDims(sce_t_sub)$TSNE)
+shuffle = sample(nrow(red),replace = F)
+
+#Density of points
+ggplot(red, aes(x=V1, y=V2))+
+  stat_bin2d(aes(color=..count..), bins=300, geom='point', size=1.4, fill=1)+
+  scale_color_viridis(trans = "log10", option='inferno')
+
+#Plot tumor cluster colors
+plotTSNE(sce_t_sub[,shuffle], shape_by = "dummy", colour_by = "tumor_cluster_100")+ scale_color_manual(values = tcols$tumor_cols)
+
+#Array number
+plotTSNE(sce_t_sub[,shuffle], shape_by = "dummy", colour_by = "ArrayNr") + scale_color_manual(values = col_vector)
+
+#Batch number
+plotTSNE(sce_t_sub[,shuffle], shape_by = "dummy", colour_by = "ArrayNr_batch")
+
+#Grade
+plotTSNE(sce_t_sub[,shuffle], shape_by = "dummy", colour_by = "Grade")+ scale_color_manual(values = cols_grade[!is.na(Grade)]$col)
+
+#Molecular signature
+plotTSNE(sce_t_sub[,shuffle], shape_by = "dummy", colour_by = "Mol_Signature")+ scale_color_manual(values = cols_mol$col)
+
+#nodal status
+plotTSNE(sce_t_sub[,shuffle], shape_by = "dummy", colour_by = "pN_4gr")+ scale_color_manual(values = cols_pN_4gr$col)
+
+#Histological type
+plotTSNE(sce_t_sub[,shuffle], shape_by = "dummy", colour_by = "TumorType")
+
+#TNM_M status
+plotTSNE(sce_t_sub[,shuffle], shape_by = "dummy", colour_by = "M_string")
+
+#Sizeflags
+plotTSNE(sce_t_sub[,shuffle], shape_by = "dummy", colour_by = "sizeflag")
+
+#GMM classifications -> of course more unsure on low panCK TNBC tumor cells
+plotTSNE(sce_t_sub[,shuffle], shape_by = "dummy", colour_by = "class")
+
+#Marker expressions
+lapply(rownames(sce_t_sub),function(x){plotTSNE(sce_t_sub, shape_by = "dummy", by_exprs_values = "counts", colour_by = x)})
+
+```
+
+Check tumor cell correlation between GATA3, ER and Bcl-2
+```{r marker correlations}
+bcl2 = t(counts(subset(sce_t,,sizeflag != 1)))[,c("Gd155_Bcl-2","Dy163_GATA3","Gd156_Estrogen Receptor Alpha")]
+cor(bcl2[,c("Gd155_Bcl-2","Dy163_GATA3")],method = "spearman")
+cor(bcl2[,c("Gd155_Bcl-2","Gd156_Estrogen Receptor Alpha")],method = "spearman")
+cor(bcl2[,c("Dy163_GATA3","Gd156_Estrogen Receptor Alpha")],method = "spearman")
+
+ggplot(as.data.frame(bcl2),aes(x = `Gd155_Bcl-2`, y = Dy163_GATA3))+geom_point(size = 0.2)+ geom_density_2d()
+
+```
+
+Make patientgroups based on primary tumor cluster compositions
+```{r pgroups, eval = F}
+#Extract necessary colData from sce
+d = as.data.frame(colData(subset(sce_t,,sizeflag != 1))[,c('tumor_cluster_100','TissueType',"PID")])
+d$id = rownames(d)
+d = as.data.table(d)
+
+#Subset to only primary tumors and calculate cluster fractions of each sample
+d = d[TissueType == "primary tumor",]
+d[,ncells := .N, by = c("tumor_cluster_100","PID")]
+d[,frac_cluster := ncells/.N, by = "PID"]
+d = unique(d[,c("tumor_cluster_100","PID","frac_cluster")])
+d = dcast.data.table(d,"PID ~ tumor_cluster_100", value.var = "frac_cluster",fill = 0)
+
+#Cluster patients based on tumor cluster fractions
+rpheno_out = cytofkit::Rphenograph(as.matrix(d[,-"PID"]), k = 20, seed = 3, approx=F)
+d$pgroups = igraph::membership(rpheno_out)
+
+#Add patient groups to sce_t
+add = as.data.table(colData(sce_t)[,c("PID")])
+add$id = colnames(sce_t)
+names(add) = c("PID","id")
+add = merge(add,d[,c("PID","pgroups")],by = "PID",all.x = T)
+add = add[order(match(id,colnames(sce_t))),]
+sce_t$pgroups = add$pgroup
+
+```
+
+Heatmap visualization of patient grouping based on primary tumors
+```{r heatmap pgroups}
+#Extract data from sce_t as above
+d = as.data.frame(colData(subset(sce_t,,sizeflag != 1))[,c('tumor_cluster_100','TissueType',"PID","pgroups")])
+d$id = rownames(d)
+d = as.data.table(d)
+d = d[TissueType == "primary tumor",]
+d[,ncells := .N, by = c("tumor_cluster_100","PID")]
+d[,test := .N,by = "PID"]
+d = d[test >=20,]#exclude images with too few tumor cells
+d[,frac_cluster := ncells/.N, by = "PID"]
+d = unique(d[,c("tumor_cluster_100","PID","frac_cluster","pgroups")])
+d = dcast.data.table(d,"PID + pgroups ~ tumor_cluster_100", value.var = "frac_cluster",fill = 0)
+
+#Get metadata to visualize as color bars next to heatmap
+meta = unique(as.data.table(colData(sce_t)[,c('Mol_Signature',"PID","Grade","TissueType","pN_4gr")]))
+meta = meta[TissueType == "primary tumor",]
+
+#Mark patients with more than 1 unique entry for a clinical feature (probably mistake in recording clinical info)
+meta[duplicated(PID),"Mol_Signature"] = NA
+meta[duplicated(PID,fromLast = T),"Mol_Signature"] = NA
+meta = unique(meta)
+meta[duplicated(PID),"Grade"] = NA
+meta[duplicated(PID,fromLast = T),"Grade"] = NA
+meta = unique(meta)
+meta[duplicated(PID),"pN_4gr"] = NA
+meta[duplicated(PID,fromLast = T),"pN_4gr"] = NA
+meta = unique(meta)
+d = merge(d,meta,by = "PID",all.x = T)
+
+#Prepare matrix for heatmap
+mat = as.matrix(d[,-c("PID","pgroups",'Mol_Signature',"Grade","TissueType","pN_4gr")])
+rownames(mat) = d$PID
+
+#Define patient group colors based on majority cell type (picked based on patient heatmap)
+pcols = data.table()
+pcols$pgroups = 1:21
+pcols$col = c("hotpink2","mediumturquoise","mediumpurple4","hotpink1","pink1","blueviolet","dodgerblue1","orange2","darkorange3","orange4","darkorange2","orangered4","hotpink","orange3","orange1","hotpink3","deeppink","orangered1","royalblue4","darkred","gray")
+
+#Save pgroup colors
+fwrite(pcols,'/mnt/ZTMA_21_25_26/analysis/pcols.csv',col.names = T)
+
+d$pN_4gr = factor(d$pN_4gr,levels = c("pN0","pN1","pN2","pN3","7"))
+d$Grade = factor(d$Grade,levels = c("G1","G2","G3","4"))
+d$Mol_Signature = factor(d$Mol_Signature, levels = cols_mol$Mol_Signature)
+
+#Heatmap primary tumor patient groups
+column_ha = HeatmapAnnotation(bar1 = tcols$cluster,col = list(bar1 = structure(tcols$tumor_cols,names = tcols$cluster)))
+h = Heatmap(mat, name = "Clustergram", km = 1, col = colorRamp2(c(0, 1), c("white", "red")),
+            show_row_names = F, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2", split = as.factor(d$pgroup), top_annotation = column_ha, use_raster = TRUE)+
+  Heatmap(as.factor(d$pgroup), name = "pgroups", show_row_names = F, width = unit(10, "mm"), col = pcols$col)+
+  Heatmap(d$Mol_Signature, name = "Clinical Types", show_row_names = F, width = unit(10, "mm"), col = structure(cols_mol$col, names = cols_mol$Mol_Signature))+
+  Heatmap(d$Grade, name = "Grade", show_row_names = F, width = unit(10, "mm"), col = structure(cols_grade$col, names = cols_grade$Grade))+
+  Heatmap(d$pN_4gr, name = "pN_4gr", show_row_names = F, width = unit(10, "mm"), col = structure(cols_pN_4gr$col, names = cols_pN_4gr$pN_4gr))
+
+#Save order of clustered patients for later plots
+pgroup_PID_order = as.numeric(as.character(d$PID[unlist(row_order(h))]))
+
+```
+
+Save heatmap to pdf (too big for viewer)
+```{r plot, eval = F}
+pdf('/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/heatmap_patients_100_colors_exclude_sizeflag.pdf',width = 10,height = 10)
+h
+dev.off()
+
+```
+
+Check whether all HR+ pgroups were clinically found to have HR+ cells too
+```{r}
+#All primaries
+d = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","core","pgroups","ER_pr")]))
+d = d[pgroups %in% c(18,15,14,12,11,10,9,8)]
+d[ER_pr < 0.20,]
+
+#Only primaries with matched samples
+mPID = unique(colData(subset(sce_t,,TissueType == "lymph node mts"))[,c("PID")])
+d = d[PID %in% mPID,]
+d[ER_pr < 0.20,]
+
+ggplot(d,aes(x = ER_pr))+geom_histogram()
+```
+
+Stacked barplot of matched primary and LN met tumor cell cluster fractions (ordered according to pgroups above)
+```{r stacked bar plot}
+#Calculate LN met fractions
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,] #exclude sizeflagged cells
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=20,] #exclude images with too few tumor cells
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Calculate primary tumor fractions
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=20,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('PID','tumor_cluster_100','frac_cluster')])
+primary = dcast.data.table(primary, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Exclude not matched samples
+primary = primary[PID %in% met$PID,]
+met = met[PID %in% primary$PID,]
+
+#Order by primary tumor patient group (from heatmap above)
+ord = pgroup_PID_order[pgroup_PID_order %in% met$PID]
+primary = primary[order(match(primary$PID,ord))]
+met = met[order(match(met$PID,ord))]
+
+```
+
+Plot stacked bar plot to pdf (too crowded for viewer)
+```{r plot,eval =F}
+pdf('/mnt/bbvolume/Data/2020/ZTMA21_25_26/R_dat/primary_met_frac.pdf',height = 20,width = 20)
+draw(rowAnnotation(primary = anno_barplot(primary[,-'PID'],axis_param = list(direction = "reverse"),gp = gpar(fill = tcols$tumor_cols[as.numeric(colnames(primary)[colnames(primary) != 'PID'])]), width = unit(10, "cm")))+
+       rowAnnotation(met = anno_barplot(met[,-'PID'],gp = gpar(colour = tcols$tumor_cols[as.numeric(colnames(met)[colnames(met) != 'PID'])],fill = tcols$tumor_cols[as.numeric(colnames(met)[colnames(met) != 'PID'])]), width = unit(10, "cm")))+
+  rowAnnotation(rn = anno_text(met$PID)))
+dev.off()
+```
+
+Make patientgroups based on LN met cluster compositions (mgroups)
+```{r mgroups, eval = F}
+#Extract colData from sce
+d = as.data.frame(colData(sce_t)[,c('tumor_cluster_100','TissueType',"PID","sizeflag")])
+d$id = rownames(d)
+d = as.data.table(d)
+
+#Subset to LN met samples and calculate cluster fractions
+d = d[TissueType == "lymph node mts",]
+d = d[sizeflag != 1,]
+d[,ncells := .N, by = c("tumor_cluster_100","PID")]
+d[,frac_cluster := ncells/.N, by = "PID"]
+d = unique(d[,c("tumor_cluster_100","PID","frac_cluster")])
+d = dcast.data.table(d,"PID ~ tumor_cluster_100", value.var = "frac_cluster",fill = 0)
+
+#Cluster patients
+rpheno_out = cytofkit::Rphenograph(as.matrix(d[,-"PID"]), k = 20, seed = 3, approx=F)
+d$PG_met = igraph::membership(rpheno_out)
+
+#Add LN met patient groups to sce_t
+add = as.data.table(colData(sce_t)[,c("PID")])
+add$id = colnames(sce_t)
+names(add) = c("PID","id")
+add = merge(add,d[,c("PID","PG_met")],by = "PID",all.x = T)
+add = add[order(match(id,colnames(sce_t))),]
+sce_t$mgroups = add$PG_met
+```
+
+Heatmap of LN met patient groups (mgroups)
+```{r heatmap mgroups}
+#Extract data from sce_t as above
+d = as.data.frame(colData(sce_t)[,c('tumor_cluster_100','TissueType',"PID","sizeflag","mgroups")])
+d$id = rownames(d)
+d = as.data.table(d)
+d = d[TissueType == "lymph node mts",]
+d = d[sizeflag != 1,]
+d[,ncells := .N, by = c("tumor_cluster_100","PID")]
+d[,test := .N,by = "PID"]
+d = d[test >=20,]#exclude images with too few tumor cells
+d[,frac_cluster := ncells/.N, by = "PID"]
+d = unique(d[,c("tumor_cluster_100","PID","frac_cluster","mgroups")])
+d = dcast.data.table(d,"PID + mgroups ~ tumor_cluster_100", value.var = "frac_cluster",fill = 0)
+
+#Add more metadata to plot next to heatmap
+meta = unique(as.data.table(colData(sce_t)[,c("TissueType","pgroups","PID")]))
+meta = meta[TissueType == "lymph node mts",]
+meta = meta[!is.na(pgroups),]
+d = merge(d,meta[,-"TissueType"],by = "PID",all.x = T)
+d$mgroups = as.character(d$mgroups)
+d$pgroups = as.character(d$pgroups)
+
+#Replace NAs with a number to make not gray but black
+d$pgroups[is.na(d$pgroups)] = "100"
+
+#Add clinical classifications of corresponding primary
+pmeta = unique(as.data.table(colData(sce_t)[,c("TissueType","Mol_Signature","PID","Grade","pN_4gr")]))
+pmeta = pmeta[TissueType == "primary tumor",]
+pmeta = pmeta[!is.na(Mol_Signature),]
+pmeta$Mol_Signature[duplicated(pmeta$PID,fromLast = F)] = "#NULL!"
+pmeta$Mol_Signature[duplicated(pmeta$PID,fromLast = T)] = "#NULL!"
+pmeta$Grade[duplicated(pmeta$PID,fromLast = T)] = NA
+pmeta$Grade[duplicated(pmeta$PID,fromLast = F)] = NA
+pmeta$pN_4gr[duplicated(pmeta$PID,fromLast = T)] = NA
+pmeta$pN_4gr[duplicated(pmeta$PID,fromLast = F)] = NA
+pmeta = unique(pmeta)
+d = merge(d,pmeta,by = "PID",all.x = T)
+
+#Rank according to both mgroups and pgroups (easier to see overlap visually)
+d = d[order(as.numeric(mgroups),pgroups),]
+
+#Plot Heatmap
+mat = as.matrix(d[,-c("PID","pgroups","mgroups","TissueType","Mol_Signature","Grade","pN_4gr")])
+rownames(mat) = d$PID
+
+#Define met patient group colors based on majority cell type (picked based on patient heatmap)
+mcols = data.table()
+mcols$pgroups = 1:12
+mcols$col = c("blueviolet","pink1","lightpink4","dodgerblue1","orange2","hotpink","cyan1","deeppink","gray","mediumpurple4","paleturquoise2","orange1")
+
+#Save out so this doesn't have to be rerun every time
+fwrite(mcols,'/mnt/ZTMA_21_25_26/analysis/mcols.csv',col.names = T)
+
+column_ha = HeatmapAnnotation(bar1 = colnames(mat),col = list(bar1 = structure(tcols$tumor_cols,names = tcols$cluster)))
+h = Heatmap(mat, name = "Clustergram", km = 1, col = colorRamp2(c(0, 1), c("white", "red")),
+            show_row_names = F, show_column_names =  T, cluster_rows = F,clustering_method_columns = "ward.D2",split = d$mgroups,top_annotation = column_ha)+ 
+  Heatmap(d$mgroups, name = "PG", show_row_names = F, width = unit(10, "mm"), col = structure(mcols$col,names = mcols$pgroups))+
+  Heatmap(d$pgroups, name = "pgroups_primary", show_row_names = F, width = unit(10, "mm"), col = structure(c(pcols$col,"black"),names = c(pcols$pgroup,"100")))+
+  Heatmap(d$Mol_Signature, name = "Clinical Types", show_row_names = F, width = unit(10, "mm"), col = structure(cols_mol$col, names = cols_mol$Mol_Signature))+
+  Heatmap(d$Grade, name = "Grade", show_row_names = F, width = unit(10, "mm"), col = structure(cols_grade$col, names = cols_grade$Grade))+
+  Heatmap(d$pN_4gr, name = "pN_4gr", show_row_names = F, width = unit(10, "mm"), col = structure(cols_pN_4gr$col, names = cols_pN_4gr$pN_4gr))
+
+```
+
+Plot heatmap out
+```{r plot,eval = F}
+pdf('/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/heatmap_patients_met.pdf',width = 10,height = 10)
+h
+dev.off()
+
+```
+
+Numbers of cells of each cluster per patient group (primary vs met)
+```{r cluster numbers pgroups}
+#LN mets
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag',"pgroups")],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,] #exclude sizeflagged cells
+met = met[!is.na(pgroups),]
+met$tumor_cluster_100 = factor(met$tumor_cluster_100, levels = row_order(h_clusters_tumor))
+
+#Primaries
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','AreaTissue','core','tumor_cluster_100','sizeflag',"pgroups")],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary = primary[!is.na(pgroups),]
+primary$tumor_cluster_100 = factor(primary$tumor_cluster_100, levels = row_order(h_clusters_tumor))
+
+#Loop through all pgroups and plot cell type numbers (could also do with mgroups)
+for (i in sort(unique(met$pgroups))){
+  cur_met = met[pgroups == i,]
+  cur_prim = primary[pgroups ==i,]
+  p1 = ggplot(cur_prim, aes(x = tumor_cluster_100,fill = tumor_cluster_100))+geom_bar(stat = "count")+
+  scale_fill_manual(values = tcols[order(match(cluster,levels(cur_prim$tumor_cluster_100)[levels(cur_prim$tumor_cluster_100) %in% unique(cur_prim$tumor_cluster_100)]))]$tumor_cols)+
+    ggtitle(paste0("Pgroup_",as.character(i),"_primary"))
+  p2 = ggplot(cur_met, aes(x = tumor_cluster_100,fill = tumor_cluster_100))+geom_bar(stat = "count")+
+  scale_fill_manual(values = tcols[order(match(cluster,levels(cur_met$tumor_cluster_100)[levels(cur_met$tumor_cluster_100) %in% unique(cur_met$tumor_cluster_100)]))]$tumor_cols)+
+    ggtitle(paste0("Pgroup_",as.character(i),"_met"))
+
+  print(p1 + p2)
+}
+```
+
+Most abundant phenotype in the primary tumor vs most abundant phenotype in the LN met (dot plot)
+```{r primary met most abundant dot plot}
+#Get most abundant LN met cluster
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=20,] #met = met[test >=20,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Extract for each sample the cluster that makes up the largest proportion of cells
+m = apply(met[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(met[,-"PID"])[x]})
+
+#Exclude samples with shared largest proportion
+PID_excl = met$PID[unlist(lapply(n,length)) > 1]
+n = n[!unlist(lapply(n,length)) > 1]
+
+#Put most abundant LN met cluster for each patient into a table
+maj_met = as.data.table(unlist(n))
+names(maj_met) = "cluster_met"
+maj_met$PID = met$PID[!met$PID %in% PID_excl]
+
+
+#Get most abundant primary tumor cluster
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=20,] #primary = primary[test >=20,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('tumor_cluster_100','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Extract for each sample the cluster that makes up the largest proportion of cells
+m = apply(primary[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(primary[,-"PID"])[x]})
+
+#Exclude samples with shared largest proportion
+PID_excl = primary$PID[unlist(lapply(n,length)) > 1]
+n = n[!unlist(lapply(n,length)) > 1]
+
+#Put most abundant primary tumor cluster for each patient into a table
+maj_prim = as.data.table(unlist(n))
+names(maj_prim) = "cluster_prim"
+maj_prim$PID = primary$PID[!primary$PID %in% PID_excl]
+
+
+#Combine primary and LN met info and calculate shared patient fraction per most abundant cluster combination
+comb = merge(maj_prim,maj_met,by = "PID")
+comb[,numb := .N ,by = c("cluster_prim","cluster_met")]
+comb[,frac_prim := numb/.N,by = "cluster_prim"]
+comb[,frac_met := numb/.N,by = "cluster_met"]
+comb = unique(comb[,-c("PID","numb")])
+
+#Fill in clusters that never appear with empty fractions so they still show up in plot
+missing = unique(sce_t$tumor_cluster_100)[!unique(sce_t$tumor_cluster_100) %in% unique(comb$cluster_prim)]
+comb = rbind(comb,data.table(cluster_prim = missing,cluster_met = 1,frac_prim = 0,frac_met = 0))
+missing = unique(sce_t$tumor_cluster_100)[!unique(sce_t$tumor_cluster_100) %in% unique(comb$cluster_met)]
+comb = rbind(comb,data.table(cluster_prim = 1,cluster_met = missing,frac_prim = 0,frac_met = 0))
+
+#Order according to cluster similarity
+comb[,cluster_prim := factor(cluster_prim,row_order(h_clusters_tumor))]
+comb[,cluster_met := factor(cluster_met,row_order(h_clusters_tumor))]
+
+#Plot bubble plot
+g = ggplot(comb,aes(x = cluster_prim, y = cluster_met, size = ifelse(frac_prim==0, NA, frac_prim),alpha = ifelse(frac_met==0, NA, frac_met),col = cluster_met))+
+  geom_point()+
+  scale_size_continuous(range = c(1,10))+
+  scale_color_manual(values = tcols[order(match(cluster,levels(comb$cluster_met))),]$tumor_cols)+
+  theme_bw()+
+  theme(axis.text.x= element_text(colour = tcols[order(match(cluster,levels(comb$cluster_met))),]$tumor_cols),
+        axis.text.y= element_text(colour = tcols[order(match(cluster,levels(comb$cluster_prim))),]$tumor_cols))
+g
+
+```
+
+Most abundant phenotype in the primary tumor vs most abundant phenotype in the LN met (flowdiagram)
+```{r primary met most abundant flowdiagram}
+#Add clinical classification info to primary tumor table with most abundant clusters
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Mol_Signature")]))
+add[duplicated(PID),Mol_Signature := "#NULL!"]
+add[duplicated(PID,fromLast = T),Mol_Signature := "#NULL!"]
+add = unique(add)
+maj_prim = merge(maj_prim,add,by = "PID",all.x = T)
+
+#Combine again with most abundant LN met cluster table and calculate frequencies of molecular subtypes per majority cluster group in primary tumors and LN mets
+comb = merge(maj_prim,maj_met,by = "PID")
+comb[,Freq := .N,by = c("cluster_prim","cluster_met","Mol_Signature")]
+comb = unique(comb[,c("cluster_prim","cluster_met","Freq","Mol_Signature")])
+comb[,cluster_prim := factor(cluster_prim,row_order(h_clusters_tumor))]
+comb[,cluster_met := factor(cluster_met,row_order(h_clusters_tumor))]
+comb[,Mol_Signature := factor(Mol_Signature,c("HER2","Luminal B (HER2+)","Luminal A","Luminal B (HER2-)","Triple negative","#NULL!"))]
+
+#Prepare color maps for most abundant clusters in ggalluvial plots
+prim_cols = tcols[cluster %in% levels(comb$cluster_prim)[levels(comb$cluster_prim) %in% unique(comb$cluster_prim)],]
+met_cols = tcols[cluster %in% levels(comb$cluster_met)[levels(comb$cluster_met) %in% unique(comb$cluster_met)],]
+prim_cols = rev(prim_cols[order(match(cluster,levels(comb$cluster_prim)[levels(comb$cluster_prim) %in% unique(comb$cluster_prim)])),]$tumor_cols)
+met_cols = rev(met_cols[order(match(cluster,levels(comb$cluster_met)[levels(comb$cluster_met) %in% unique(comb$cluster_met)])),]$tumor_cols)
+
+#Plot flow diagram
+g = ggplot(comb,aes(y = Freq,
+           axis1 = Mol_Signature, axis2 = cluster_prim , axis3 = cluster_met)) +
+  geom_flow(aes(fill = cluster_prim)) +
+  scale_x_discrete(limits = c("Mol_Signature","cluster_prim","cluster_met")) +
+  scale_fill_manual(values = rev(prim_cols))+
+  geom_stratum(fill = c(rev(cols_mol[order(match(Mol_Signature,levels(comb$Mol_Signature))),][1:6]$col),prim_cols,met_cols))+
+  geom_text(stat = "stratum", infer.label = TRUE)
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/flow_20.pdf")
+g
+dev.off()
+
+
+
+#Separate color bar for molecular subtypes for next to flowdiagram
+comb = merge(maj_prim,maj_met,by = "PID")
+comb[,Freq := .N,by = c("cluster_prim","cluster_met","Mol_Signature")]
+comb[,cluster_prim := factor(cluster_prim,row_order(h_clusters_tumor))]
+comb[,cluster_met := factor(cluster_met,row_order(h_clusters_tumor))]
+comb[,Mol_Signature := factor(Mol_Signature,c("HER2","Luminal B (HER2+)","Luminal A","Luminal B (HER2-)","Triple negative","#NULL!"))]
+
+#Ordered according to LN mets (lay next to LN mets of flowdiagram)
+comb = comb[order(cluster_met,Mol_Signature),]
+comb[,PID := factor(PID,levels = rev(PID))]
+ggplot(comb,aes(y = PID, fill = Mol_Signature))+geom_bar(stat = "count")+scale_fill_manual(values = cols_mol[order(match(Mol_Signature,levels(comb$Mol_Signature))),][1:6]$col)
+
+#Ordered according to primary tumors (lay next to primary tumors of flowdiagram)
+comb = comb[order(cluster_prim,Mol_Signature),]
+comb[,PID := factor(PID,levels = rev(PID))]
+ggplot(comb,aes(y = PID, fill = Mol_Signature))+geom_bar(stat = "count")+scale_fill_manual(values = cols_mol[order(match(Mol_Signature,levels(comb$Mol_Signature))),][1:6]$col)
+
+```
+
+Check whether all HR+ pgroups were clinically found to have HR+ cells too
+```{r}
+HRpos = comb[cluster_prim %in% c(20,49,8,14,24,28,21,53,9,35),]
+
+#All primaries
+d = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","ER_pr","core")]))
+d = merge(HRpos,d,by = "PID")
+d[,ncore := .N,by = "PID"]
+d[ncore == 2,]
+
+#1569 doesn't count because there are two cores and one of them is clinically ER_pr =1 and the other =0, we averaged across both for the comparison to LN met
+d[ER_pr < 0.20,]
+
+
+ggplot(d,aes(x = ER_pr))+geom_histogram()
+```
+
+Met most abundant cluster vs fraction of that cluster in matched primary tumors
+```{r met cluster fraction in primary}
+#Get most abundant LN met cluster
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+#Exclude shitty images and cells
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test > 20,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Extract most abundant
+m = apply(met[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(met[,-"PID"])[x]})
+
+#Exclude samples with shared largest proportion -> don't exclude just randomly sample!!!!
+# PID_excl = met$PID[unlist(lapply(n,length)) > 1]
+# n = n[!unlist(lapply(n,length)) > 1]
+
+n[unlist(lapply(n,length)) > 1] = lapply(n[unlist(lapply(n,length)) > 1],function(x){x[[1]][1]})
+
+#Into table
+maj_met = as.data.table(unlist(n))
+names(maj_met) = "cluster_met"
+maj_met$PID = met$PID#[!met$PID %in% PID_excl]
+maj_met[,numb_met := .N,by = c("cluster_met")]
+
+
+#Calculate fractions of most abundant LN met cell type in corresponding primary tumors
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >= 20,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('tumor_cluster_100','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Combine with most abundant LN met table
+comb = merge(primary,maj_met,by = "PID")
+comb = melt.data.table(comb,id.vars = c("PID","cluster_met"))
+comb = comb[cluster_met == variable,]
+comb = comb[,-"PID"]
+colnames(comb) = c("cluster_met","presence_prim","fraction_prim")
+comb= comb[rev(order(fraction_prim)),]
+comb[,pres_num := 1:.N,by = "presence_prim"]
+comb[,cluster_met := factor(cluster_met,row_order(h_clusters_tumor))]
+```
+
+Write out to pdf (too big for viewer)
+```{r plot, eval F}
+pdf('/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/how_rare_majority_met.pdf',height = 30)
+ggplot(comb,aes(x = pres_num,y = fraction_prim, fill = cluster_met)) + geom_bar(stat = "identity")+
+facet_wrap(~cluster_met,ncol = 1)+
+  scale_fill_manual(values = tcols[order(match(cluster, levels(comb$cluster_met)[levels(comb$cluster_met) %in% unique(comb$cluster_met)]))]$tumor_cols)
+dev.off()
+
+```
+
+In how many patients is the most abundant cluster in the LN met different from the most abundant cluster in the corresponding primary tumor
+```{r #patients most abundant cluster differs}
+#Most abundant LN met cluster
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=20,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+m = apply(met[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(met[,-"PID"])[x]})
+# PID_excl = met$PID[unlist(lapply(n,length)) > 1]
+# n = n[!unlist(lapply(n,length)) > 1]
+n[unlist(lapply(n,length)) > 1] = lapply(n[unlist(lapply(n,length)) > 1],function(x){x[[1]][1]})
+maj_met = as.data.table(unlist(n))
+names(maj_met) = "cluster_met"
+maj_met$PID = met$PID#[!met$PID %in% PID_excl]
+
+#Most abundant primary tumor cluster
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+#Exclude shitty images and cells
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=20,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('tumor_cluster_100','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+m = apply(primary[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(primary[,-"PID"])[x]})
+# PID_excl = primary$PID[unlist(lapply(n,length)) > 1]
+# n = n[!unlist(lapply(n,length)) > 1]
+n[unlist(lapply(n,length)) > 1] = lapply(n[unlist(lapply(n,length)) > 1],function(x){x[[1]][1]})
+maj_prim = as.data.table(unlist(n))
+names(maj_prim) = "cluster_prim"
+maj_prim$PID = primary$PID#[!primary$PID %in% PID_excl]
+
+#Combine
+comb = merge(maj_prim,maj_met,by = "PID")
+comb$grp[comb$cluster_prim == comb$cluster_met] = "same"
+comb$grp[is.na(comb$grp)] = "different"
+
+#Plot bar
+p = comb[,nPID := .N, by = c("grp")]
+p = unique(p[,c("grp","nPID")])
+g1 = ggplot(p,aes(x = as.factor(1),y = nPID, fill = grp))+geom_bar(stat = "identity")+scale_fill_grey()+
+  theme(aspect.ratio = 2)+
+  ggtitle("Majority cell type")
+
+
+```
+
+How often is the most abundant LN met cluster found in the corresponding primary tumor at all and in what fraction
+```{r #patients met cluster present in primary}
+#Most abundant LN met cluster
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=20,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+m = apply(met[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(met[,-"PID"])[x]})
+# PID_excl = met$PID[unlist(lapply(n,length)) > 1]
+# n = n[!unlist(lapply(n,length)) > 1]
+n[unlist(lapply(n,length)) > 1] = lapply(n[unlist(lapply(n,length)) > 1],function(x){x[[1]][1]})
+maj_met = as.data.table(unlist(n))
+names(maj_met) = "cluster"
+maj_met$PID = met$PID#[!met$PID %in% PID_excl]
+
+#Cluster presences in primary tumors
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=20,]
+primary[,frac := ncells/.N,by = "PID"]
+
+#Only look at matched samples
+comb = maj_met[PID %in% primary$PID,]
+
+#Check how many cells of the most abundant LN met cluster are in the corresponding primary tumor for each match
+comb$fracPrim = NA
+comb$existsPrim = NA
+for (i in 1:nrow(comb)){
+  curPID = comb$PID[i]
+  curClus = comb$cluster[i]
+  unIDs = unique(primary[PID == curPID & tumor_cluster_100 == curClus]$id)
+  #Abs number of cells present
+  comb$existsPrim[i] = length(unIDs)
+  if (length(unIDs) > 0){
+    #Fraction of cells in primary tumor
+    comb$fracPrim[i] = unique(primary[PID == curPID & tumor_cluster_100 == curClus]$frac)
+  }
+}
+
+#With a threshold of at least 10 cells for presence
+comb$existsLog[comb$existsPrim < 10 ] = "absent"
+comb$existsLog[is.na(comb$existsLog)] = "present"
+
+#Plot bar
+p = comb[,nPID := .N, by = c("existsLog")]
+p = unique(p[,c("existsLog","nPID")])
+g2 = ggplot(p,aes(x = as.factor(1),y = nPID, fill = existsLog))+geom_bar(stat = "identity")+scale_fill_grey()+
+  theme(aspect.ratio = 2)+
+  ggtitle("At least 10 cells")
+
+#With a threshold of at least 5 cells for presence
+comb$existsLog = NULL
+comb$existsLog[comb$existsPrim < 5 ] = "absent"
+comb$existsLog[is.na(comb$existsLog)] = "present"
+
+#Plot bar
+p = comb[,nPID := .N, by = c("existsLog")]
+p = unique(p[,c("existsLog","nPID")])
+g3 = ggplot(p,aes(x = as.factor(1),y = nPID, fill = existsLog))+geom_bar(stat = "identity")+scale_fill_grey()+
+  theme(aspect.ratio = 2)+
+  ggtitle("At least 5 cells")
+
+#Plot bars side by side
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/bar_same.pdf")
+g1|g2|g3
+dev.off()
+
+
+#Cumulative density function for number of patients with at least a given fraction of the most abundant LN met cluster in the corresponding primary tumor
+comb$fracPrim[is.na(comb$fracPrim)] = 0
+ggplot(comb, aes(x= fracPrim)) + geom_density(stat = "ecdf")
+
+
+#Reverse cumulative density colored by most abundant LN met cluster (patients ranked by fraction of most abundant LN met cluster in primary tumor)
+for (i in rev(unique(sort(comb$fracPrim)))){
+  num = nrow(comb[fracPrim >= i,])
+  comb[fracPrim == i,num_aboveThresh := num]
+}
+comb$cluster = as.factor(comb$cluster)
+
+#Plot with dots
+ggplot(comb, aes(x= fracPrim, y = num_aboveThresh, col = cluster)) + geom_point() + scale_color_manual(values = tcols[order(match(cluster,levels(comb$cluster)))]$tumor_cols)
+
+#Plot as bars
+ggplot(comb, aes(x= fracPrim, y = num_aboveThresh, fill = cluster)) + geom_bar(stat = "identity",position = "dodge") + scale_fill_manual(values = tcols[order(match(cluster,levels(comb$cluster)))]$tumor_cols)
+
+```
+
+When the most abundant LN met phenotype is not found in primary - which patient groups are those?
+```{r}
+#Add pgroup info
+add = unique(as.data.table(colData(subset(sce_t,, TissueType == "primary tumor"))[,c("PID","pgroups")]))
+comb_pgroups = merge(comb, add,all.x = T,by = "PID")
+comb_pgroups = comb_pgroups[!is.na(pgroups)]
+
+#Calculate fractions of pgroups in absent/present
+comb_pgroups[,n := .N,by = c("pgroups","existsLog")]
+comb_pgroups[,frac := n/.N, by = "pgroups"]
+comb_pgroups[,pgroups := as.factor(pgroups)]
+comb_pgroups = unique(comb_pgroups[,c("n","frac","pgroups","existsLog")])
+
+ggplot(comb_pgroups, aes(fill=pgroups, y=frac, x=existsLog)) + 
+    geom_bar(position="dodge", stat="identity")+
+  scale_fill_manual(values = pcols$col)
+
+ggplot(comb_pgroups, aes(fill=existsLog, y=frac, x=pgroups)) + 
+    geom_bar( stat="identity")+
+  scale_fill_manual(values = pcols$col)
+
+
+#Add mgroup info
+add = unique(as.data.table(colData(subset(sce_t,, TissueType == "lymph node mts"))[,c("PID","mgroups")]))
+comb_pgroups = merge(comb, add,all.x = T,by = "PID")
+
+#Calculate fractions of mgroups in absent/present
+comb_pgroups[,n := .N,by = c("mgroups","existsLog")]
+comb_pgroups[,frac := n/.N, by = "mgroups"]
+comb_pgroups[,mgroups := as.factor(mgroups)]
+comb_pgroups = unique(comb_pgroups[,c("n","frac","mgroups","existsLog")])
+
+ggplot(comb_pgroups, aes(fill=mgroups, y=frac, x=existsLog)) + 
+    geom_bar(position="dodge", stat="identity")+
+  scale_fill_manual(values = mcols$col)
+
+ggplot(comb_pgroups, aes(fill=existsLog, y=frac, x=mgroups)) + 
+    geom_bar( stat="identity")+
+  scale_fill_manual(values = mcols$col)
+```
+
+Same as above but for predominant phenotype instead of pgroups
+```{r}
+#Get most abundant LN met cluster
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=20,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Extract for each sample the cluster that makes up the largest proportion of cells
+m = apply(met[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(met[,-"PID"])[x]})
+
+#Exclude samples with shared largest proportion
+PID_excl = met$PID[unlist(lapply(n,length)) > 1]
+n = n[!unlist(lapply(n,length)) > 1]
+
+#Put most abundant LN met cluster for each patient into a table
+maj_met = as.data.table(unlist(n))
+names(maj_met) = "cluster_met"
+maj_met$PID = met$PID[!met$PID %in% PID_excl]
+
+#Combine with info if present or not
+comb_met = merge(comb, maj_met,all.x = T,by = "PID")
+comb_met = comb_met[!is.na(cluster_met),]
+
+#Calculate fractions of cluster_met in absent/present
+comb_met[,n := .N,by = c("cluster_met","existsLog")]
+comb_met[,frac := n/.N, by = "cluster_met"]
+comb_met[,cluster_met := as.factor(cluster_met)]
+comb_met = unique(comb_met[,c("n","frac","cluster_met","existsLog")])
+
+ggplot(comb_met, aes(fill=cluster_met, y=frac, x=existsLog)) + 
+    geom_bar(position="dodge", stat="identity")+
+  scale_fill_manual(values = tcols[order(match(cluster,levels(comb_met$cluster_met))),]$tumor_cols)
+
+ggplot(comb_met, aes(fill=existsLog, y=frac, x=cluster_met)) + 
+    geom_bar( stat="identity")
+
+
+#Get most abundant primary tumor cluster
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=20,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('tumor_cluster_100','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Extract for each sample the cluster that makes up the largest proportion of cells
+m = apply(primary[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(primary[,-"PID"])[x]})
+
+#Exclude samples with shared largest proportion
+PID_excl = primary$PID[unlist(lapply(n,length)) > 1]
+n = n[!unlist(lapply(n,length)) > 1]
+
+#Put most abundant primary tumor cluster for each patient into a table
+maj_prim = as.data.table(unlist(n))
+names(maj_prim) = "cluster_prim"
+maj_prim$PID = primary$PID[!primary$PID %in% PID_excl]
+
+#Combine with info if present or not
+comb_prim = merge(comb, maj_prim,all.x = T,by = "PID")
+comb_prim = comb_prim[!is.na(cluster_prim),]
+
+#Calculate fractions of cluster_met in absent/present
+comb_prim[,n := .N,by = c("cluster_prim","existsLog")]
+comb_prim[,frac := n/.N, by = "cluster_prim"]
+comb_prim[,cluster_prim := as.factor(cluster_prim)]
+comb_prim = unique(comb_prim[,c("n","frac","cluster_prim","existsLog")])
+
+ggplot(comb_prim, aes(fill=cluster_prim, y=frac, x=existsLog)) + 
+    geom_bar(position="dodge", stat="identity")+
+  scale_fill_manual(values = tcols[order(match(cluster,levels(comb_prim$cluster_prim))),]$tumor_cols)
+
+ggplot(comb_prim, aes(fill=existsLog, y=frac, x=cluster_prim)) + 
+    geom_bar( stat="identity")
+
+
+#FlowDiagram of only not matched ones
+#Add clinical classification info to primary tumor table with most abundant clusters
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Mol_Signature")]))
+add[duplicated(PID),Mol_Signature := "#NULL!"]
+add[duplicated(PID,fromLast = T),Mol_Signature := "#NULL!"]
+add = unique(add)
+maj_prim = merge(maj_prim,add,by = "PID",all.x = T)
+
+all = merge(maj_met,maj_prim,by = "PID")
+all = merge(all,comb,by = "PID")
+all = all[existsLog == "absent",]
+
+all[,Freq := .N,by = c("cluster_prim","cluster_met","Mol_Signature")]
+all = unique(all[,c("cluster_prim","cluster_met","Freq","Mol_Signature")])
+all[,cluster_prim := factor(cluster_prim,row_order(h_clusters_tumor))]
+all[,cluster_met := factor(cluster_met,row_order(h_clusters_tumor))]
+all[,Mol_Signature := factor(Mol_Signature,c("HER2","Luminal B (HER2+)","Luminal A","Luminal B (HER2-)","Triple negative","#NULL!"))]
+
+#Prepare color maps for most abundant clusters in ggalluvial plots
+prim_cols = tcols[cluster %in% levels(all$cluster_prim)[levels(all$cluster_prim) %in% unique(all$cluster_prim)],]
+met_cols = tcols[cluster %in% levels(all$cluster_met)[levels(all$cluster_met) %in% unique(all$cluster_met)],]
+prim_cols = rev(prim_cols[order(match(cluster,levels(all$cluster_prim)[levels(all$cluster_prim) %in% unique(all$cluster_prim)])),]$tumor_cols)
+met_cols = rev(met_cols[order(match(cluster,levels(all$cluster_met)[levels(all$cluster_met) %in% unique(all$cluster_met)])),]$tumor_cols)
+
+#Plot flow diagram
+g = ggplot(all,aes(y = Freq,
+           axis1 = Mol_Signature, axis2 = cluster_prim , axis3 = cluster_met)) +
+  geom_flow(aes(fill = cluster_met)) +
+  scale_x_discrete(limits = c("Mol_Signature","cluster_prim","cluster_met")) +
+  scale_fill_manual(values = rev(met_cols))+
+  geom_stratum(fill = c(rev(cols_mol[order(match(Mol_Signature,levels(all$Mol_Signature))),][1:6]$col),prim_cols,met_cols))+
+  geom_text(stat = "stratum", infer.label = TRUE)
+g
+
+
+#Numbers of cells in mets present vs absent
+all = merge(maj_prim,maj_met,by = "PID")
+
+add = as.data.table(colData(subset(sce_t,,TissueType == "lymph node mts" & sizeflag != 1))[,c("PID","core","tumor_cluster_100")])
+add[,ncells_met := .N, by = "PID"]
+add = unique(add[,c("PID","core","ncells_met")])
+
+all = merge(all,add,by = "PID")
+all = merge(all,comb,by = "PID")
+
+g1 = ggplot(all,aes(y = ncells_met, x = existsLog))+geom_boxplot()
+
+#check out met images with few cells that have no match
+ggplot(all,aes(x = ncells_met))+geom_density()
+exclude = all[existsLog == "absent" & ncells_met < 500,]$PID
+
+#Flowdiagram without problematic LNs
+all = all[existsLog == "absent" & !PID %in% exclude,]
+
+all[,Freq := .N,by = c("cluster_prim","cluster_met","Mol_Signature")]
+all = unique(all[,c("cluster_prim","cluster_met","Freq","Mol_Signature")])
+all[,cluster_prim := factor(cluster_prim,row_order(h_clusters_tumor))]
+all[,cluster_met := factor(cluster_met,row_order(h_clusters_tumor))]
+all[,Mol_Signature := factor(Mol_Signature,c("HER2","Luminal A","Luminal B (HER2-)","Triple negative","#NULL!"))]
+
+#Prepare color maps for most abundant clusters in ggalluvial plots
+prim_cols = tcols[cluster %in% levels(all$cluster_prim)[levels(all$cluster_prim) %in% unique(all$cluster_prim)],]
+met_cols = tcols[cluster %in% levels(all$cluster_met)[levels(all$cluster_met) %in% unique(all$cluster_met)],]
+prim_cols = rev(prim_cols[order(match(cluster,levels(all$cluster_prim)[levels(all$cluster_prim) %in% unique(all$cluster_prim)])),]$tumor_cols)
+met_cols = rev(met_cols[order(match(cluster,levels(all$cluster_met)[levels(all$cluster_met) %in% unique(all$cluster_met)])),]$tumor_cols)
+mol_col_cur = cols_mol[Mol_Signature %in% levels(all$Mol_Signature),]
+
+#Plot flow diagram
+g = ggplot(all,aes(y = Freq,
+           axis1 = Mol_Signature, axis2 = cluster_prim , axis3 = cluster_met)) +
+  geom_flow(aes(fill = cluster_met)) +
+  scale_x_discrete(limits = c("Mol_Signature","cluster_prim","cluster_met")) +
+  scale_fill_manual(values = rev(met_cols))+
+  geom_stratum(fill = c(rev(mol_col_cur[order(match(Mol_Signature,levels(all$Mol_Signature))),]$col),prim_cols,met_cols))+
+  geom_text(stat = "stratum", infer.label = TRUE)
+g
+
+
+
+
+#Numbers of cells in primary present vs absent
+all = merge(maj_prim,maj_met,by = "PID")
+
+add = as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"& sizeflag != 1))[,c("PID","core","tumor_cluster_100")])
+add[,ncells_prim := .N, by = "PID"]
+add = unique(add[,c("PID","core","ncells_prim")])
+
+all = merge(all,add,by = "PID")
+all = merge(all,comb,by = "PID")
+
+g2 = ggplot(all,aes(y = ncells_prim, x = existsLog))+geom_boxplot()
+
+ggplot(all,aes(x = ncells_prim))+geom_density()
+exclude2 = all[existsLog == "absent" & ncells_prim < 500,]$PID
+
+#Flowdiagram without problematic LNs
+all = all[existsLog == "absent" & !PID %in% exclude & !PID %in% exclude2,]
+
+all[,Freq := .N,by = c("cluster_prim","cluster_met","Mol_Signature")]
+all = unique(all[,c("cluster_prim","cluster_met","Freq","Mol_Signature")])
+all[,cluster_prim := factor(cluster_prim,row_order(h_clusters_tumor))]
+all[,cluster_met := factor(cluster_met,row_order(h_clusters_tumor))]
+all[,Mol_Signature := factor(Mol_Signature,c("HER2","Luminal A","Luminal B (HER2-)","Triple negative"))]
+
+#Prepare color maps for most abundant clusters in ggalluvial plots
+prim_cols = tcols[cluster %in% levels(all$cluster_prim)[levels(all$cluster_prim) %in% unique(all$cluster_prim)],]
+met_cols = tcols[cluster %in% levels(all$cluster_met)[levels(all$cluster_met) %in% unique(all$cluster_met)],]
+prim_cols = rev(prim_cols[order(match(cluster,levels(all$cluster_prim)[levels(all$cluster_prim) %in% unique(all$cluster_prim)])),]$tumor_cols)
+met_cols = rev(met_cols[order(match(cluster,levels(all$cluster_met)[levels(all$cluster_met) %in% unique(all$cluster_met)])),]$tumor_cols)
+mol_col_cur = cols_mol[Mol_Signature %in% levels(all$Mol_Signature),]
+
+#Plot flow diagram
+g = ggplot(all,aes(y = Freq,
+           axis1 = Mol_Signature, axis2 = cluster_prim , axis3 = cluster_met)) +
+  geom_flow(aes(fill = cluster_met)) +
+  scale_x_discrete(limits = c("Mol_Signature","cluster_prim","cluster_met")) +
+  scale_fill_manual(values = rev(met_cols))+
+  geom_stratum(fill = c(rev(mol_col_cur[order(match(Mol_Signature,levels(all$Mol_Signature))),]$col),prim_cols,met_cols))+
+  geom_text(stat = "stratum", infer.label = TRUE)
+g
+```
+
+Dot plot fraction cell type in met vs primary on all cell types
+```{r fraction cluster met primary}
+#Met
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=100,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Primary
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=100,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('tumor_cluster_100','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+met = met[PID %in% primary$PID,]
+primary = primary[PID %in% met$PID,]
+met = met[order(match(PID, primary$PID)),]
+
+
+met = melt.data.table(met,id.vars = "PID")
+primary = melt.data.table(primary,id.vars = "PID")
+
+comb = merge(met,primary,by = c("PID","variable"))
+colnames(comb) = c("PID","cluster","frac_met","frac_primary")
+
+#Exclude ones that are not present in primary or met
+comb = comb[!(frac_met == 0 & frac_primary == 0),]
+
+#Use only significantly differentially abundant clusters
+comb$cluster = as.numeric(as.character(comb$cluster))
+comb = comb[cluster %in% c(8,9,20,42,21,49,5,4,47,3,53,44,2,15,38,10,16,37,51,29)]
+#comb = comb[cluster %in% c(37,51,29)]
+#comb = comb[cluster %in% c(8,9,20,42,21,49,5,4,47,3,53,44,2,15,38,10,16)]
+comb$cluster = as.factor(comb$cluster)
+  
+g1 = ggplot(comb,aes(x = frac_met, y = frac_primary,color = cluster))+
+  geom_point(size = 2)+
+  scale_color_manual(values = tcols[order(match(cluster,levels(comb$cluster))),]$tumor_cols)+
+  theme_bw()
+
+#Correlation
+cor(comb$frac_met,comb$frac_primary)
+
+#Average and sd across all of same color
+comb[,frac_met_avg:= mean(frac_met),by = "cluster"]
+comb[,frac_met_sd:= sd(frac_met),by = "cluster"]
+comb[,frac_met_se:= frac_met_sd/sqrt(.N),by = "cluster"]
+comb[,frac_prim_avg:= mean(frac_primary),by = "cluster"]
+comb[,frac_prim_sd:= sd(frac_primary),by = "cluster"]
+comb[,frac_prim_se:= frac_prim_sd/sqrt(.N),by = "cluster"]
+
+meancomb = unique(comb[,c("cluster","frac_met_avg","frac_met_sd","frac_prim_avg","frac_prim_sd","frac_met_se","frac_prim_se")])
+
+g2 = ggplot(meancomb,aes(x = frac_met_avg, y = frac_prim_avg,color = cluster))+
+  geom_point(size = 2)+
+  scale_color_manual(values = tcols[order(match(cluster,levels(meancomb$cluster))),]$tumor_cols)+
+  geom_errorbar(aes(ymin=frac_prim_avg-frac_prim_se, ymax=frac_prim_avg+frac_prim_se), width=0)+
+  geom_errorbarh(aes(xmin = frac_met_avg-frac_met_se ,xmax = frac_met_avg+frac_met_se), height=0)+
+  xlim(0,0.2)+
+  geom_abline(slope = 1)+
+  theme_bw()
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/diff_abundance_plots.pdf")
+g1 | g2
+dev.off()
+
+```
+
+Same but with metaclusters
+```{r same with metaclusters}
+#Met
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','metaclusters','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'metaclusters')]
+met[,test := .N,by = "PID"]
+met = met[test >=100,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('metaclusters','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ metaclusters',value.var = 'frac_cluster',fill = 0)
+
+#Primary
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','metaclusters','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'metaclusters')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=100,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('metaclusters','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ metaclusters',value.var = 'frac_cluster',fill = 0)
+
+met = met[PID %in% primary$PID,]
+primary = primary[PID %in% met$PID,]
+met = met[order(match(PID, primary$PID)),]
+
+
+met = melt.data.table(met,id.vars = "PID")
+primary = melt.data.table(primary,id.vars = "PID")
+
+comb = merge(met,primary,by = c("PID","variable"))
+colnames(comb) = c("PID","cluster","frac_met","frac_primary")
+
+#Exclude ones that are not present in primary or met
+comb = comb[!(frac_met == 0 & frac_primary == 0),]
+
+ggplot(comb,aes(x = frac_met, y = frac_primary,color = cluster))+
+  geom_point()+
+  scale_color_manual(values = metacols[order(match(meta,levels(comb$cluster))),]$col)
+
+#Correlation
+cor(comb$frac_met,comb$frac_primary)
+
+```
+
+Dot plot presence/absence cell type in met vs primary on all cell types
+```{r presence cluster primary met}
+#Metastasis
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+#Exclude shitty images and cells
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met[,tot_cluster := .N, by = "tumor_cluster_100"]
+nr_bars = unique(met[,c("tot_cluster","tumor_cluster_100")])
+met = met[test >=100,]
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",fun.aggregate = length)
+binm = met[,-"PID"]
+binm[binm < 5] = 0
+binm[binm >= 5] = 1
+binm$PID = met$PID
+
+#Primary
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+#Exclude shitty images and cells
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary[,tot_cluster := .N, by = "tumor_cluster_100"]
+nr_bars = unique(primary[,c("tot_cluster","tumor_cluster_100")])
+primary = primary[test >=100,]
+primary = dcast.data.table(primary,"PID ~ tumor_cluster_100",fun.aggregate = length)
+binp = primary[,-"PID"]
+binp[binp < 5] = 0
+binp[binp >= 5] = 1
+binp$PID = primary$PID
+
+binm = binm[PID %in% binp$PID,]
+binp = binp[PID %in% met$PID,]
+binm = binm[order(match(PID, binp$PID)),]
+
+
+binm = melt.data.table(binm,id.vars = "PID")
+binp = melt.data.table(binp,id.vars = "PID")
+
+comb = merge(binm,binp,by = c("PID","variable"))
+colnames(comb) = c("PID","cluster","pres_met","pres_primary")
+
+comb[,size := .N,by = c("cluster","pres_met","pres_primary")]
+comb = unique(comb[,c("cluster","pres_met","pres_primary","size")])
+ggplot(comb,aes(x = pres_met, y = pres_primary,color = cluster,size = size))+
+  geom_point(position = position_dodge2(width = 0.3))+
+  scale_color_manual(values = tcols[order(match(cluster,levels(comb$cluster))),]$tumor_cols)
+
+```
+
+Paired differential abundance analysis of tumor clusters between matched primary and LN met samples
+```{r differential abundance}
+#Extract relevant information for primary tumor and LN met samples
+both = as.data.table(data.frame(colData(subset(sce_t,,TissueType %in% c("primary tumor","lymph node mts")))[c('TissueType','PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType %in% c("primary tumor","lymph node mts")))))
+
+#Exclude sizeflagged cells
+both = both[sizeflag != 1,]
+
+#Only use samples with matched primary and LN met tissue
+both[,test:= length(unique(TissueType)),by = "PID"]
+both = both[test == 2,]
+
+#Calculate number of cells from each cluster in primary and LN met sample of each patient
+both[,ncells:=.N ,by= c('PID','TissueType', 'tumor_cluster_100')]
+both = unique(both[,c('tumor_cluster_100','ncells','PID','TissueType')])
+
+#Prepare data for differential abundance analysis using edgeR
+both = dcast.data.table(both, 'PID + TissueType ~ tumor_cluster_100',value.var = 'ncells',fill = 0)
+both$TissueType = factor(both$TissueType,levels =c("primary tumor","lymph node mts"))
+both$PID = factor(both$PID)
+
+#Create design matrix
+design <- createDesignMatrix(
+  both[,c("PID","TissueType")], cols_design = c( "PID","TissueType")
+)
+
+#Create contrast
+contrast <- createContrast(c(rep(0, ncol(design)-1),1))
+
+#Check contrast
+data.frame(parameters = colnames(design), contrast)
+
+#Normalize
+norm_factors <- calcNormFactors(t(both[,-c("PID","TissueType")]), method = "TMM")
+
+#Differential abundance
+y <- DGEList(t(both[,-c("PID","TissueType")]), norm.factors = norm_factors)
+y <- estimateDisp(y,design)
+
+#Diagnostic plots following http://bioconductor.org/books/release/OSCA/multi-sample-comparisons.html#differential-abundance
+plotBCV(y, cex=1,col.trend=NA)
+fit.ab <- glmQLFit(y, design, robust=TRUE, abundance.trend=FALSE)
+plotQLDisp(fit.ab, cex=1)
+
+#Model
+fit <- glmFit(y, design)
+lrt <- glmLRT(fit, contrast = contrast)
+top <- edgeR::topTags(lrt, n = Inf, adjust.method = "BH", 
+        sort.by = "none")
+
+
+#Write out result table
+res = as.data.table(top$table)
+res$cluster = rownames(top$table)
+res$sign = 0
+res$sign[res$FDR < 0.01] = 1
+res[order(FDR)]
+
+ggplot(res,aes(x = logCPM,y = logFC,colour = as.factor(sign)))+ geom_point() +scale_colour_manual(values = c("black","steel blue2"))+theme_bw()
+
+cols = tcols[cluster %in% res[sign ==1,]$cluster,]
+res$cols = "black"
+res[sign ==1,]$cols = cols$tumor_cols
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/DA_paired_color.pdf")
+ggplot(res,aes(x = logCPM,y = logFC,colour = ifelse(sign == 1,cluster,"non-sign")))+ geom_point(size = 3,alpha = 0.5) +scale_colour_manual(values = c(res[order(cluster)]$cols[res[order(cluster)]$cols != "black"], "black"))+theme_bw()
+dev.off()
+
+#Plot logFC of significant clusters
+res = res[sign == 1,]
+res[logFC > 0,posneg := "pos"]
+res[logFC < 0,posneg := "neg"]
+res = res[order(logFC)]
+res[,cluster := factor(cluster,levels = cluster)]
+res = res[logCPM > 12,]
+
+ggplot(res,aes(y = cluster, x = logFC, fill = posneg))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = c("lightblue","purple"))
+
+ggplot(res,aes(y = cluster, x = logFC, fill = cluster))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = tcols[order(match(cluster,res$cluster))]$tumor_cols)
+
+ggplot(res,aes(x = logCPM,y = logFC))+ geom_point()
+
+```
+
+Differential abundance not paired
+```{r DA non-paired}
+
+#Extract relevant information for primary tumor and LN met samples
+both = as.data.table(data.frame(colData(subset(sce_t,,TissueType %in% c("primary tumor","lymph node mts")))[c('TissueType','PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType %in% c("primary tumor","lymph node mts")))))
+
+#Exclude sizeflagged cells
+both = both[sizeflag != 1,]
+
+#Only use samples with matched primary and LN met tissue even when not doing paired test (otherwise biased)
+both[,test:= length(unique(TissueType)),by = "PID"]
+both = both[test == 2,]
+
+#Calculate number of cells from each cluster in primary and LN met sample of each patient
+both[,ncells:=.N ,by= c('PID','TissueType', 'tumor_cluster_100')]
+both = unique(both[,c('tumor_cluster_100','ncells','PID','TissueType')])
+
+#Prepare data for differential abundance analysis using edgeR
+both = dcast.data.table(both, 'PID + TissueType ~ tumor_cluster_100',value.var = 'ncells',fill = 0)
+both$TissueType = factor(both$TissueType,levels =c("primary tumor","lymph node mts"))
+both$PID = factor(both$PID)
+
+#Create design matrix
+design <- createDesignMatrix(
+  both[,c("TissueType")], cols_design = c("TissueType")
+)
+
+#Create contrast
+contrast <- createContrast(c(rep(0, ncol(design)-1),1))
+
+#Check contrast
+data.frame(parameters = colnames(design), contrast)
+
+# #Normalize
+# norm_factors <- calcNormFactors(t(both[,-c("PID","TissueType")]), method = "TMM")
+
+#Differential abundance
+y <- DGEList(t(both[,-c("PID","TissueType")]))#, norm.factors = norm_factors)
+y <- estimateDisp(y,design)
+
+#Diagnostic plots following http://bioconductor.org/books/release/OSCA/multi-sample-comparisons.html#differential-abundance
+plotBCV(y, cex=1,col.trend=NA)
+fit.ab <- glmQLFit(y, design, robust=TRUE, abundance.trend=FALSE)
+plotQLDisp(fit.ab, cex=1)
+
+#Model
+fit <- glmFit(y, design)
+lrt <- glmLRT(fit, contrast = contrast)
+top <- edgeR::topTags(lrt, n = Inf, adjust.method = "BH", 
+        sort.by = "none")
+
+
+#Write out result table
+res = as.data.table(top$table)
+res$cluster = rownames(top$table)
+res$sign = 0
+res$sign[res$FDR < 0.01] = 1
+res[order(FDR)]
+
+cols = tcols[cluster %in% res[sign ==1,]$cluster,]
+res$cols = "black"
+res[sign ==1,]$cols = cols$tumor_cols
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/DA_nonpaired.pdf")
+ggplot(res,aes(x = logCPM,y = logFC,colour = ifelse(sign == 1,cluster,"non-sign")))+ geom_point(size = 3,alpha = 0.5) +scale_colour_manual(values = c(res[order(cluster)]$cols[res[order(cluster)]$cols != "black"], "black"))+geom_text(label = res$cluster)+theme_bw()
+dev.off()
+
+#Plot logFC of significant clusters
+res = res[sign == 1,]
+res[logFC > 0,posneg := "pos"]
+res[logFC < 0,posneg := "neg"]
+res = res[order(logFC)]
+res[,cluster := factor(cluster,levels = cluster)]
+res = res[logCPM > 12,]
+
+ggplot(res,aes(y = cluster, x = logFC, fill = posneg))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = c("lightblue","purple"))
+
+ggplot(res,aes(y = cluster, x = logFC, fill = cluster))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = tcols[order(match(cluster,res$cluster))]$tumor_cols)
+
+
+```
+
+Differential abundance node-pos -neg
+```{r}
+#Extract relevant information for primary tumor and LN met samples
+both = as.data.table(data.frame(colData(subset(sce_t,,TissueType =="primary tumor"))[c('pN_4gr','PID','core','tumor_cluster_100','sizeflag',"Mol_Signature")],id = colnames(subset(sce_t,,TissueType =="primary tumor"))))
+
+#Exclude sizeflagged cells
+both = both[sizeflag != 1,]
+both = both[pN_4gr != "7",]
+both = both[Mol_Signature != "#NULL!",]
+
+#Node neg vs pos
+both[pN_4gr %in% c("pN0"),node := "negative"]
+both[pN_4gr %in% c("pN1","pN2","pN3"),node := "positive"]
+
+#Calculate number of cells from each cluster in  each patient
+both[,ncells:=.N ,by= c('PID','tumor_cluster_100')]
+both = unique(both[,c('tumor_cluster_100','ncells','PID','node',"Mol_Signature")])
+
+#Prepare data for differential abundance analysis using edgeR
+both = dcast.data.table(both, 'PID + node + Mol_Signature ~ tumor_cluster_100',value.var = 'ncells',fill = 0)
+both$node = factor(both$node,levels =c("negative","positive"))
+both$Mol_Signature = factor(both$Mol_Signature,levels = c("Luminal A","Luminal B (HER2-)","Luminal B (HER2+)","HER2","Triple negative"))
+
+#Create design matrix
+design <- createDesignMatrix(
+  both[,c("node","Mol_Signature")], cols_design = c("node","Mol_Signature")
+)
+
+#Create contrast
+contrast <- createContrast(c(0,1,rep(0, ncol(design)-2)))
+
+#Check contrast
+data.frame(parameters = colnames(design), contrast)
+
+# #Normalize
+# norm_factors <- calcNormFactors(t(both[,-c("PID","TissueType")]), method = "TMM")
+
+#Differential abundance
+y <- DGEList(t(both[,-c("PID","node","Mol_Signature")]))#, norm.factors = norm_factors)
+y <- estimateDisp(y,design)
+
+#Diagnostic plots following http://bioconductor.org/books/release/OSCA/multi-sample-comparisons.html#differential-abundance
+plotBCV(y, cex=1,col.trend=NA)
+fit.ab <- glmQLFit(y, design, robust=TRUE, abundance.trend=FALSE)
+plotQLDisp(fit.ab, cex=1)
+
+#Model
+fit <- glmFit(y, design)
+lrt <- glmLRT(fit, contrast = contrast)
+top <- edgeR::topTags(lrt, n = Inf, adjust.method = "BH", 
+        sort.by = "none")
+
+
+#Write out result table
+res = as.data.table(top$table)
+res$cluster = rownames(top$table)
+res$sign = 0
+res$sign[res$FDR < 0.01] = 1
+res[order(FDR)]
+
+cols = tcols[cluster %in% res[sign ==1,]$cluster,]
+res$cols = "black"
+res[sign ==1,]$cols = cols$tumor_cols
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/DA_nodeneg_pos.pdf")
+ggplot(res,aes(x = logCPM,y = logFC,colour = ifelse(sign == 1,cluster,"non-sign")))+ geom_point(size = 3,alpha = 0.5) +scale_colour_manual(values = c(res[order(cluster)]$cols[res[order(cluster)]$cols != "black"], "black"))+geom_text(label = res$cluster)+theme_bw()
+dev.off()
+
+ggplot(res,aes(x = logCPM,y = logFC,colour = as.factor(sign)))+ geom_point() +scale_colour_manual(values = c("black","steel blue2"))+theme_bw()
+
+#Plot logFC of significant clusters
+res = res[sign == 1,]
+res[logFC > 0,posneg := "pos"]
+res[logFC < 0,posneg := "neg"]
+res = res[order(logFC)]
+res[,cluster := factor(cluster,levels = cluster)]
+res = res[logCPM > 13,]
+
+ggplot(res,aes(y = cluster, x = logFC, fill = posneg))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = c("lightblue","purple"))
+
+ggplot(res,aes(y = cluster, x = logFC, fill = cluster))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = tcols[order(match(cluster,res$cluster))]$tumor_cols)
+
+```
+
+Tumor phenotype cluster correlations within prim/met and between prim and met (based on cluster fractions)
+```{r cluster correlation fractions}
+#Primary tumor cluster fractions
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100',"sizeflag")],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+# primary[,test := .N,by = "PID"]
+# primary = primary[test >=100,]
+
+#Also extract absolute numbers of cell in each cluster
+primary[,tot_cluster := .N, by = "tumor_cluster_100"]
+nr_bars = unique(primary[,c("tot_cluster","tumor_cluster_100")])
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('PID','tumor_cluster_100','frac_cluster')])
+primary = dcast.data.table(primary, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Order according to cluster similarity (from cluster heatmap)
+primary = primary[,c("PID",row_order(h_clusters_tumor)),with = F]
+
+#Calculate cluster correlations
+prim_cor = cor(primary[,-"PID"],method = "pearson")
+
+#Order bars accordingly
+nr_bars = nr_bars[order(match(tumor_cluster_100,row_order(h_clusters_tumor))),]
+
+#Clustered heatmap
+ha_prim = HeatmapAnnotation(tumor = colnames(prim_cor),
+    col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+t_primary_clustered = rowAnnotation(Nr_cells = anno_barplot(nr_bars$tot_cluster,axis_param = list(direction = "reverse"), width = unit(20, "mm"))) +
+  Heatmap(rownames(prim_cor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  Heatmap(prim_cor, name = "correlation",column_title = "tumor primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_prim)+
+  rowAnnotation(rn = anno_text(rownames(prim_cor)))
+t_primary_clustered
+
+#Heatmap ordered according to cluster similarity from tumor cluster heatmap
+t_primary = rowAnnotation(Nr_cells = anno_barplot(nr_bars$tot_cluster,axis_param = list(direction = "reverse"), width = unit(20, "mm"))) +
+  Heatmap(rownames(prim_cor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  Heatmap(prim_cor, name = "correlation",column_title = "tumor primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,cluster_columns = F,top_annotation = ha_prim)+
+  rowAnnotation(rn = anno_text(rownames(prim_cor)))
+t_primary
+
+
+#LN met cluster fractions
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100',"sizeflag")],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+# met[,test := .N,by = "PID"]
+# met = met[test >=100,]
+
+#Also extract absolute numbers of cell in each cluster
+met[,tot_cluster := .N, by = "tumor_cluster_100"]
+nr_bars = unique(met[,c("tot_cluster","tumor_cluster_100")])
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#cluster 16 doesn't appear in mets, fill up with 0s
+met$`16` = 0
+
+#Order according to cluster similarity
+met = met[,c("PID",row_order(h_clusters_tumor)),with = F]
+
+#Calculate correlations
+met_cor = cor(met[,-"PID"],method = "pearson")
+met_cor[is.na(met_cor)] = 0
+
+#Order bars accordingly
+nr_bars = nr_bars[order(match(tumor_cluster_100,row_order(h_clusters_tumor))),]
+
+#clustered heatmap
+ha_met = HeatmapAnnotation(tumor = colnames(met_cor),
+    col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+t_met_clustered = rowAnnotation(Nr_cells = anno_barplot(nr_bars$tot_cluster,axis_param = list(direction = "reverse"), width = unit(20, "mm"))) +
+  Heatmap(rownames(met_cor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  Heatmap(met_cor, name = "correlation",column_title = "tumor met", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_met)+
+  rowAnnotation(rn = anno_text(rownames(met_cor)))
+t_met_clustered
+
+#Heatmap ordered according to cluster similarity
+t_met = Heatmap(rownames(met_cor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  Heatmap(met_cor, name = "correlation",column_title = "tumor met", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,cluster_columns = F,top_annotation = ha_met)+
+  rowAnnotation(rn = anno_text(rownames(met_cor)))+
+  rowAnnotation(Nr_cells = anno_barplot(nr_bars$tot_cluster, width = unit(20, "mm")))
+t_met
+
+
+#Cluster correlations between primary and LN met
+#Exclude not matched samples
+primary = primary[PID %in% met$PID,]
+met = met[PID %in% primary$PID,]
+
+#Order according to cluster similarity
+primary = primary[,c("PID",row_order(h_clusters_tumor)),with = F]
+met = met[,c("PID",row_order(h_clusters_tumor)),with = F]
+
+#Calculate correlations
+crosscor = cor(primary[,-"PID"],met[,-"PID"])
+crosscor[is.na(crosscor)] = 0
+
+#Clustered heatmap
+ha_mix = HeatmapAnnotation(tumor = colnames(crosscor),
+    col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+t_met_prim_clustered = Heatmap(rownames(crosscor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  Heatmap(crosscor, name = "correlation",column_title = "tumor met primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_mix)+
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+t_met_prim_clustered
+
+#Heatmap ordered according to cluster similarity
+t_met_prim = Heatmap(rownames(crosscor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  Heatmap(crosscor, name = "correlation",column_title = "tumor met primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,cluster_columns = F,top_annotation = ha_mix)+
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+t_met_prim
+
+#Plot heatmaps side to side
+t_primary + t_met_prim + t_met
+
+```
+
+Tumor cluster correlations based on cluster densities
+```{r cluster correlation densities}
+#Primary tumor densities
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag',"AreaTissue")],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('core', 'tumor_cluster_100')]
+primary[,test := .N,by = "core"]
+primary = primary[test >=100,]
+
+#Absolute number of cells in clusters
+primary[,tot_cluster := .N, by = "tumor_cluster_100"]
+nr_bars = unique(primary[,c("tot_cluster","tumor_cluster_100")])
+primary[,density_core := ncells/AreaTissue,by = c("core","tumor_cluster_100")]
+primary = unique(primary[,c("PID","core","tumor_cluster_100","density_core")])
+primary[,density_PID := mean(density_core),by = c("PID","tumor_cluster_100")]
+primary = unique(primary[,c("PID","density_PID","tumor_cluster_100")])
+primary = dcast.data.table(primary,"PID ~ tumor_cluster_100",value.var = "density_PID",fill = 0)
+
+#Order according to cluster similarity (from tumor cluster heatmap)
+primary = primary[,c("PID",row_order(h_clusters_tumor)),with = F]
+
+#Calculate correlations within primary
+prim_cor = cor(primary[,-"PID"],method = "pearson")
+
+#Order bars accordingly
+nr_bars = nr_bars[order(match(tumor_cluster_100,row_order(h_clusters_tumor))),]
+
+#Clustered heatmap
+ha_prim = HeatmapAnnotation(tumor = colnames(prim_cor),
+    col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+t_primary_clustered = rowAnnotation(Nr_cells = anno_barplot(nr_bars$tot_cluster,axis_param = list(direction = "reverse"), width = unit(20, "mm"))) +
+  Heatmap(rownames(prim_cor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  Heatmap(prim_cor, name = "correlation",column_title = "tumor primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_prim)+
+  rowAnnotation(rn = anno_text(rownames(prim_cor)))
+t_primary_clustered
+  
+#Ordered according to cluster similarities
+t_primary = rowAnnotation(Nr_cells = anno_barplot(nr_bars$tot_cluster,axis_param = list(direction = "reverse"), width = unit(20, "mm"))) +
+  Heatmap(rownames(prim_cor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  Heatmap(prim_cor, name = "correlation",column_title = "tumor primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,cluster_columns = F,top_annotation = ha_prim)+
+  rowAnnotation(rn = anno_text(rownames(prim_cor)))
+t_primary
+
+
+#LN met densities
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag',"AreaTissue")],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('core', 'tumor_cluster_100')]
+met[,test := .N,by = "core"]
+met = met[test >=100,]
+
+#Absolute cluster numbers
+met[,tot_cluster := .N, by = "tumor_cluster_100"]
+nr_bars = unique(met[,c("tot_cluster","tumor_cluster_100")])
+met[,density_core := ncells/AreaTissue,by = c("core","tumor_cluster_100")]
+met = unique(met[,c("PID","core","tumor_cluster_100","density_core")])
+met[,density_PID := mean(density_core),by = c("PID","tumor_cluster_100")]
+met = unique(met[,c("PID","density_PID","tumor_cluster_100")])
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",value.var = "density_PID",fill = 0)
+
+#16 doesn't appear in mets, fill up with 0s
+met$`16` = 0
+
+#Order according to cluster similarity
+met = met[,c("PID",row_order(h_clusters_tumor)),with = F]
+
+#Calculate correlations within LN mets
+met_cor = cor(met[,-"PID"],method = "pearson")
+met_cor[is.na(met_cor)] = 0
+
+#Order bars accordingly
+nr_bars = nr_bars[order(match(tumor_cluster_100,row_order(h_clusters_tumor))),]
+
+#clustered heatmap
+ha_met = HeatmapAnnotation(tumor = colnames(met_cor),
+    col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+t_met_clustered = rowAnnotation(Nr_cells = anno_barplot(nr_bars$tot_cluster,axis_param = list(direction = "reverse"), width = unit(20, "mm"))) +
+  Heatmap(rownames(met_cor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  Heatmap(met_cor, name = "correlation",column_title = "tumor met", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_met)+
+  rowAnnotation(rn = anno_text(rownames(met_cor)))
+t_met_clustered
+
+#Heatmap ordered according to cluster similarity
+t_met = Heatmap(rownames(met_cor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  Heatmap(met_cor, name = "correlation",column_title = "tumor met", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,cluster_columns = F,top_annotation = ha_met)+
+  rowAnnotation(rn = anno_text(rownames(met_cor)))+
+  rowAnnotation(Nr_cells = anno_barplot(nr_bars$tot_cluster, width = unit(20, "mm")))
+t_met
+
+
+#Cluster density correlations between matched primary and LN met
+primary = primary[PID %in% met$PID,]
+met = met[PID %in% primary$PID,]
+
+#Order according to cluster similarity
+primary = primary[,c("PID",row_order(h_clusters_tumor)),with = F]
+met = met[,c("PID",row_order(h_clusters_tumor)),with = F]
+
+#Calculate correlations
+crosscor = cor(primary[,-"PID"],met[,-"PID"])
+crosscor[is.na(crosscor)] = 0
+
+#Clustered heatmap
+ha_mix = HeatmapAnnotation(tumor = colnames(crosscor),
+    col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+t_met_prim_clustered = Heatmap(crosscor, name = "correlation",column_title = "tumor met primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_mix)+
+  Heatmap(rownames(crosscor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+t_met_prim_clustered
+
+#Heatmap ordered according to cluster similarity
+t_met_prim = Heatmap(rownames(crosscor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  Heatmap(crosscor, name = "correlation",column_title = "tumor met primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,cluster_columns = F,top_annotation = ha_mix)+
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+t_met_prim
+
+#Plot side by side
+t_primary + t_met_prim + t_met
+
+```
+
+In patients with multiple LN met samples, what are cell type distributions across different LN samples?
+```{r multiple LN met samples}
+#LN mets
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+
+#Only multip LN
+multiLN = unique(met[,c("PID","core")])
+multiLN[,n := .N,by = c("PID")]
+multiLN = multiLN[n > 1,]
+met = met[PID %in% multiLN$PID,]
+
+#Calculate cluster fractions per sample
+met[,ncells:=.N ,by= c('core', 'tumor_cluster_100')]
+met = unique(met[,c('tumor_cluster_100','ncells','core',"PID")])
+met$tumor_cluster_100 = as.character(met$tumor_cluster_100)
+
+#Plot facet wrap barplots by PID
+ggplot(met,aes(x = core,y = ncells,fill = tumor_cluster_100))+
+  geom_bar(stat = "identity")+
+  facet_wrap(~PID,scales = "free")+
+  scale_fill_manual(values = tcols[order(match(cluster,sort(unique(met$tumor_cluster_100)))),]$tumor_cols)
+
+```
+
+Check cell type distributions in patients with matched distant met
+```{r distant met - Laura}
+#Mark patients with different sample combinations available
+all = unique(as.data.table(colData(sce_t)[,c("PID","TissueType")]))
+all = dcast.data.table(all,"PID ~ TissueType",fun.aggregate = length)
+
+#Extract clustering info
+dat = as.data.table(data.frame(colData(subset(sce_t,,sizeflag != 1))[c('PID','core','tumor_cluster_100','sizeflag','TissueType')],id = colnames(subset(sce_t,,sizeflag != 1))))
+
+#Only all 3
+cur = dat[PID %in% all[`distant mts` & `lymph node mts` & `primary tumor`,]$PID,]
+
+#Cluster proportions
+cur[,ncells:=.N ,by= c("PID",'TissueType', 'tumor_cluster_100')]
+cur = unique(cur[,c('tumor_cluster_100','ncells','TissueType',"PID")])
+cur$tumor_cluster_100 = as.character(cur$tumor_cluster_100)
+cur$TissueType = factor(cur$TissueType,levels = c("primary tumor","lymph node mts","distant mts","tumor recurrence"))
+
+#Plot
+ggplot(cur,aes(x = TissueType,y = ncells,fill = tumor_cluster_100))+
+  geom_bar(stat = "identity")+
+  facet_wrap(~PID,scales = "free")+
+  scale_fill_manual(values = tcols[order(match(cluster,sort(unique(cur$tumor_cluster_100)))),]$tumor_cols)
+
+#Compare average marker levels
+sub <- subset(sce_t, ,PID %in% all[`distant mts` & `lymph node mts` & `primary tumor`,]$PID & sizeflag != 1)
+d <- as.data.table(colData(sub)[,c("PID","core","TissueType")])
+d <- cbind(d,t(counts(sub)))
+d <- melt.data.table(d,id.vars = c("PID","core","TissueType"))
+d[,avg := mean(value),by = c("variable","core")]
+d <- unique(d[,-"value"])
+
+ggplot(d, aes(y = avg,x = TissueType))+geom_boxplot()+facet_wrap(~variable)+theme(axis.text.x = element_text(angle = 90))
+
+pdf("/home/jana/distant_mets.pdf")
+ggplot(d, aes(TissueType, avg)) +
+  geom_boxplot(width=0.3, size=1.5, fatten=1.5, colour="grey70") +
+  geom_point(colour="red", size=2, alpha=0.5) +
+  geom_line(aes(group=PID), colour="red", linetype="11") +
+  theme_classic()+facet_wrap(~variable)+theme(axis.text.x = element_text(angle = 90))
+dev.off()
+
+
+#Same for all primary vs LN mets
+sub <- subset(sce_t, ,PID %in% all[`lymph node mts` & `primary tumor`,]$PID & sizeflag != 1)
+d <- as.data.table(colData(sub)[,c("PID","core","TissueType")])
+d <- cbind(d,t(counts(sub)))
+d <- melt.data.table(d,id.vars = c("PID","core","TissueType"))
+d[,avg := mean(value),by = c("variable","core")]
+d <- unique(d[,-"value"])
+d <- d[TissueType %in% c("primary tumor","lymph node mts")]
+
+ggplot(d, aes(y = avg,x = TissueType))+geom_boxplot()+facet_wrap(~variable)+theme(axis.text.x = element_text(angle = 90))
+
+pdf("/home/jana/LN_mets.pdf")
+ggplot(d, aes(TissueType, avg)) +
+  geom_boxplot(width=0.3, size=0.5, colour="black") +
+  geom_point(colour="red", size=1, alpha=0.5) +
+  geom_line(aes(group=PID),size = 0.5, colour="red", linetype="11") +
+  theme_classic()+facet_wrap(~variable)+theme(axis.text.x = element_text(angle = 90))
+dev.off()
+
+#Correlation average marker expressions
+dd <- dcast.data.table(d,"PID + variable ~ TissueType",value.var = "avg",fun.aggregate = mean)
+
+pdf("/home/jana/correlations_matched.pdf")
+ggplot(dd,aes(x = `primary tumor`,y = `lymph node mts`))+geom_point()+facet_wrap(~variable)+ stat_cor(method = "pearson")+geom_smooth(method='lm', formula= y~x)
+dev.off()
+
+#Randomize patient ID
+dd[,random_primary := `primary tumor`[sample(.N)],by = "variable"]
+pdf("/home/jana/correlations_random.pdf")
+ggplot(dd,aes(x = random_primary,y = `lymph node mts`))+geom_point()+facet_wrap(~variable)+ stat_cor(method = "pearson")+geom_smooth(method='lm', formula= y~x)
+dev.off()
+
+
+
+#Primary and dist met
+cur = dat[PID %in% all[`distant mts` & `primary tumor`,]$PID,]
+
+#Cluster proportions
+cur[,ncells:=.N ,by= c("PID",'TissueType', 'tumor_cluster_100')]
+cur = unique(cur[,c('tumor_cluster_100','ncells','TissueType',"PID")])
+cur$tumor_cluster_100 = as.character(cur$tumor_cluster_100)
+cur$TissueType = factor(cur$TissueType,levels = c("primary tumor","lymph node mts","distant mts","tumor recurrence"))
+
+#Plot
+ggplot(cur,aes(x = TissueType,y = ncells,fill = tumor_cluster_100))+
+  geom_bar(stat = "identity")+
+  facet_wrap(~PID,scales = "free")+
+  scale_fill_manual(values = tcols[order(match(cluster,sort(unique(cur$tumor_cluster_100)))),]$tumor_cols)
+
+
+#Primary and recurrence
+cur = dat[PID %in% all[`tumor recurrence` & `primary tumor`,]$PID,]
+
+#Cluster proportions
+cur[,ncells:=.N ,by= c("PID",'TissueType', 'tumor_cluster_100')]
+cur = unique(cur[,c('tumor_cluster_100','ncells','TissueType',"PID")])
+cur$tumor_cluster_100 = as.character(cur$tumor_cluster_100)
+cur$TissueType = factor(cur$TissueType,levels = c("primary tumor","lymph node mts","distant mts","tumor recurrence"))
+
+#Plot
+ggplot(cur,aes(x = TissueType,y = ncells,fill = tumor_cluster_100))+
+  geom_bar(stat = "identity")+
+  facet_wrap(~PID,scales = "free")+
+  scale_fill_manual(values = tcols[order(match(cluster,sort(unique(cur$tumor_cluster_100)))),]$tumor_cols)
+
+```
+
+Survival model based on average tumor cell marker expressions in LN mets
+```{r survival marker levels met}
+#Calculate average tumor cell marker expression levels in LN mets
+pm = as.data.table(t(counts(subset(sce_t,,TissueType %in% c("lymph node mts") & sizeflag != 1))))
+pm$PID = subset(sce_t,,TissueType %in% c("lymph node mts") & sizeflag != 1)$PID
+pm = aggregate(pm[,-"PID"],by = list(pm$PID),FUN = mean)
+names(pm)[1] = "PID"
+
+#Combine with survival data from sce_t
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+surv_dat = merge(surv_dat,pm,by = "PID")
+
+#Run cox proportional hazards model including all markers
+res.cox1 <- coxph(Surv(surv_dat$OS, surv_dat$censoring) ~ ., data =  surv_dat[,-c("TissueType",'OS','Livestatus1censored',"PID","censoring","core")])
+summary(res.cox1)
+
+#Run lasso regularized coxph model
+x = as.matrix(surv_dat[,-c("TissueType",'OS','Livestatus1censored',"PID","censoring","core")])
+y = Surv(surv_dat$OS, surv_dat$censoring)
+cv.fit <- cv.glmnet(x, y, family="cox")
+fit <-glmnet(x, y, family="cox")
+Coefficients <- coef(fit, s = cv.fit$lambda.min)
+
+#Run lasso 500 times and average error curves to be more robust
+MSEs <- NULL
+for (i in 1:500){
+                 cv <- cv.glmnet(x, y, family="cox")
+                 MSEs <- cbind(MSEs, cv$cvm)
+             }
+rownames(MSEs) <- cv$lambda
+lambda.min <- as.numeric(names(which.min(rowMeans(MSEs))))
+fit <-glmnet(x, y, family="cox")
+Coefficients <- coef(fit, s = lambda.min)
+
+#Extract non-zeros from model output
+td_coef = as.data.table(tidy(Coefficients))
+td_coef = td_coef[order(value),]
+td_coef$row = factor(td_coef$row,levels = td_coef$row)
+colnames(td_coef) = c("celltype","column","coef")
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = celltype, y = exp(coef))) +
+geom_point(size = 4) +
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+```
+
+Coxph using only p53 and GATA3 marker levels in LN mets
+```{r survival p53 GATA3}
+#Subset data to include only p53 and GATA3
+sub = surv_dat[,c("Dy163_GATA3","Tb159_p53",'OS','Livestatus1censored',"PID","censoring")]
+#sub = cbind(log1p(sub[,c("Dy163_GATA3","Tb159_p53")]),sub[,c('OS','Livestatus1censored',"PID","censoring")]) #Alternatively log1p transformed
+res.cox1 <- coxph(Surv(sub$OS, sub$censoring) ~ ., data =  sub[,-c('OS','Livestatus1censored',"PID","censoring")])
+summary(res.cox1)
+
+#Reformat model output
+td_coef = as.data.table(tidy(res.cox1,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = sub("cluster_","",td_coef$term)
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios with CIs
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+```
+
+Kaplan-Meier curves for different quartiles of p53 and GATA3 expression in LN mets
+```{r KM p53 GATA3}
+#Patients in upper quartiles for each marker
+sub[,Q4_p53 := Tb159_p53 >= quantile(Tb159_p53,0.75)]
+sub[,Q4_GATA3 := Dy163_GATA3 >= quantile(Dy163_GATA3,0.75)]
+
+#Split into patients that are in upper quartile for either of the markers but not both
+sub$grp = NULL
+sub[Q4_p53& !Q4_GATA3,grp:= "bad"]
+sub[!Q4_p53& Q4_GATA3,grp:= "good"]
+
+#Alternatively split into upper quartile vs rest for p53
+sub$grp = NULL
+sub[Q4_p53 == T, grp := "bad"]
+sub[Q4_p53 != T,grp := "notbad"]
+
+#Alternatively split into upper quartile vs rest for GATA3
+sub$grp = NULL
+sub[Q4_GATA3 == T, grp := "good"]
+sub[Q4_GATA3 != T,grp := "notgood"]
+
+#Calc survival stats
+SurvObj <- Surv(sub$OS, sub$censoring)
+km.as.groups <- survfit(SurvObj ~ sub$grp)
+
+#Plot Kaplan-Meier curves
+ggplot(tidy(km.as.groups), aes(time, estimate, group = strata)) +
+    geom_line(aes(color = strata)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .25)+
+  ylim(0,1)
+
+sub$grp = NULL
+sub$Q4_p53 = NULL
+sub$Q4_GATA3 = NULL
+
+```
+
+Coxph using only p53 and GATA3 marker levels and clinical features in LN mets
+```{r coxph p53 GATA3 clin}
+#Add clinical features and remove non-unique clinical patient classifications (probably error in recording)
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "lymph node mts"))[,c("PID","Grade","Mol_Signature","pN_4gr")]))
+add$Mol_Signature[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$Mol_Signature[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add = unique(add)
+clin_sub = merge(sub,add,by = "PID",all.x = T)
+
+#Clean clinical info for nodal status (entry 7 and #NULL! mean NA) and set reference level
+clin_sub[pN_4gr == "pN0",pN_4gr := "#NULL!"]#These are LN met samples, can't be N0
+clin_sub[is.na(pN_4gr),pN_4gr := "#NULL!"]
+clin_sub[pN_4gr == "7",pN_4gr := "#NULL!"]
+clin_sub[,pN_4gr := factor(pN_4gr,levels = c("pN1","pN2","pN3","#NULL!"))]
+
+#Clean clinical info for grade (entry 4 and #NULL! mean NA) and set reference level
+clin_sub[is.na(Grade),Grade := "#NULL!"]
+clin_sub[Grade == "4",pN_4gr := "#NULL!"]
+clin_sub[,Grade := factor(Grade,levels = c("G3","G2","G1","#NULL!"))]
+
+#Clean clinical info for molecular aubtype (entry #NULL! means NA) and set reference level (LumA too small group)
+clin_sub[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+clin_sub[,Mol_Signature := factor(Mol_Signature,levels = c("Luminal B (HER2-)","Luminal A","Luminal B (HER2+)","HER2","Triple negative","#NULL!"))]
+
+#Coxph survival model on p53, GATA3 and clinical features
+res.cox1 <- coxph(Surv(clin_sub$OS, clin_sub$censoring) ~ ., data =  clin_sub[,-c('OS','Livestatus1censored',"PID","censoring")])
+summary(res.cox1)
+
+#Extract model output
+td_coef = as.data.table(tidy(res.cox1,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = sub("cluster_","",td_coef$term)
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')
+
+```
+
+Combine the above with heterogeneity measure - does it improve model?
+```{r heterogeneity and marker levels survival}
+#Calculate cluster numbers in LN mets and overall heterogeneity (as later on in pipeline 2)
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=20,]
+met = unique(met[,c("PID","tumor_cluster_100","ncells")])
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",fill =0)
+met$entropy = apply(as.matrix(met[,-"PID"]),1,entropy.ChaoShen)
+met = unique(met[,c("PID","entropy")])
+
+#From above
+surv_dat = merge(clin_sub,met,by = "PID")
+surv_dat$Tb159_p53 = surv_dat$Tb159_p53 * 1.5
+surv_dat$Dy163_GATA3 = surv_dat$Dy163_GATA3 * 1.5
+
+#Smaller model
+res.cox1 <- coxph(Surv(surv_dat$OS, surv_dat$censoring) ~ ., data =  surv_dat[,-c("PID","entropy","Livestatus1censored")])
+summary(res.cox1)
+
+#Bigger model
+res.cox2 <- coxph(Surv(surv_dat$OS, surv_dat$censoring) ~ ., data =  surv_dat[,-c("PID","Livestatus1censored")])
+summary(res.cox2)
+
+#Likelihood ratio test
+anova(res.cox1,res.cox2)
+
+#Extract model output for bigger model
+td_coef = as.data.table(tidy(res.cox2,exponentiate = T))
+td_coef = td_coef[order(estimate),]
+td_coef$term = sub("cluster_","",td_coef$term)
+td_coef$term = factor(td_coef$term,levels = td_coef$term)
+
+#Visualize hazard ratios
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/shannon_markers.pdf")
+ggplot(td_coef, aes(x = term, y = estimate)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = conf.high, ymin = conf.low))+
+coord_flip()+ylim(0,10)+
+geom_hline(yintercept = 1,color = 'blue')#+
+#scale_y_continuous(trans='log')
+dev.off()
+
+```
+
+Survival model on PCs of average tumor cell marker expressions in LN mets
+```{r survival pca}
+#Calculate PCA
+pca = prcomp(surv_dat[,-c("PID","TissueType","core",'OS','Livestatus1censored','censoring')], scale = FALSE)
+
+#Visualize variance explained by PCs
+fviz_eig(pca)
+
+#Add first 10 PCs to survival model
+surv_dat = cbind(pca$x[,1:10],surv_dat[,c("OS","censoring")])
+res.cox2 <- coxph(Surv(surv_dat$OS, surv_dat$censoring) ~ ., data =  surv_dat)
+summary(res.cox2)
+
+#Visualize loadings for bad prognosis PCs 3 and 4
+fviz_pca_var(pca,
+             axes = c(3,4),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+
+#Visualize loadings for bad prognosis PCs 1 and 4
+fviz_pca_var(pca,
+             axes = c(1,4),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+
+#Visualize loadings for bad prognosis PCs 1 and 3
+fviz_pca_var(pca,
+             axes = c(1,3),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+```
+
+Survival model based on average tumor cell marker expressions in primary tumors
+```{r survival marker levels primary}
+#Extract avergae tumor cell marker expressions of primary tumors
+p = as.data.table(t(counts(subset(sce_t,,TissueType %in% c("primary tumor") & sizeflag != 1))))
+p$PID = subset(sce_t,,TissueType %in% c("primary tumor") & sizeflag != 1)$PID
+p = aggregate(p[,-"PID"],by = list(p$PID),FUN = mean)
+names(p)[1] = "PID"
+
+#Add survival info
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+surv_dat = merge(surv_dat,p,by = "PID")
+
+#Coxph model including all markers
+res.cox1 <- coxph(Surv(surv_dat$OS, surv_dat$censoring) ~ ., data =  surv_dat[,-c("TissueType",'OS','Livestatus1censored',"PID","censoring","core")])
+summary(res.cox1)
+
+#Lasso regularized coxph
+cv.fit <- cv.glmnet(as.matrix(surv_dat[,-c('OS','Livestatus1censored',"PID","censoring")]), Surv(surv_dat$OS, surv_dat$censoring), family="cox")
+plot(cv.fit)
+Coefficients <- coef(cv.fit, s = cv.fit$lambda.min)
+Active.Index <- which(Coefficients != 0)
+Active.Coefficients <- Coefficients[Active.Index]
+Coefficients
+
+#Survival model on PCs in primaries
+pca = prcomp(surv_dat[,-c("PID",'OS','Livestatus1censored','censoring')], scale = FALSE)
+fviz_eig(pca)
+
+#Use first 10 PCs
+surv_dat = cbind(pca$x[,1:10],surv_dat[,c("OS","censoring")])
+
+#Survival model on PCs
+res.cox2 <- coxph(Surv(surv_dat$OSfinal, surv_dat$censoring) ~ ., data =  surv_dat)
+summary(res.cox2)
+
+fviz_pca_var(pca,
+             axes = c(1,2),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+
+
+fviz_pca_var(pca,
+             axes = c(1,4),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+
+fviz_pca_var(pca,
+             axes = c(4,3),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+
+```
+
+Survival model based on presence of phenotype clusters in primary and met (in matched samples) -> this was not used, too few samples in this combination and way to unstable results!
+```{r survival cluster presence met and prim}
+#Extract cluster numbers in LN mets
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,] #exclude sizeflagged cells
+met[,test := .N,by = "PID"]
+met = met[test >=100,] #exclude images with less than 100 tumor cells
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",fun.aggregate = length)
+
+#Convert to binary (1 = cluster present, 0 = not present; threshold for presence: at least 5 cells)
+binm = met[,-"PID"]
+binm[binm < 5] = 0
+binm[binm >= 5] = 1
+binm$PID = met$PID
+
+#Add met to the column names to distinguish from primary cluster presences
+colnames(binm)[colnames(binm) != "PID"] = paste0('met_',colnames(binm)[colnames(binm) != "PID"])
+
+
+#Extract cluster numbers in primary tumors
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]#exclude sizeflagged cells
+primary[,test := .N,by = "PID"]
+primary = primary[test >=100,]#exclude images with less than 100 tumor cells
+primary = dcast.data.table(primary,"PID ~ tumor_cluster_100",fun.aggregate = length)
+
+#Convert to binary (1 = cluster present, 0 = not present; threshold for presence: at least 5 cells)
+binp = primary[,-"PID"]
+binp[binp < 5] = 0
+binp[binp >= 5] = 1
+binp$PID = primary$PID
+
+#Add primary to the column names
+colnames(binp)[colnames(binp) != "PID"] = paste0('primary_',colnames(binp)[colnames(binp) != "PID"])
+
+#Combine primary and met binary cluster presences for matched samples
+binm = binm[PID %in% binp$PID,]
+binp = binp[PID %in% binm$PID,]
+comb = merge(binm,binp,by = "PID")
+
+#Add survival information
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+surv_dat = merge(surv_dat,comb,by = "PID")
+
+#Use lasso-regularized coxph model to find clusters that stratify patients according to survival
+x = as.matrix(surv_dat[,-c("PID","OS","Livestatus1censored","censoring")])
+y = Surv(surv_dat$OS, surv_dat$censoring)
+
+#Use standardize = F because predictors are categorical
+cv.fit <- cv.glmnet(x, y, family="cox",standardize = F)
+fit <-glmnet(x, y, family="cox",standardize = F)
+plot(cv.fit)
+Coefficients <- coef(fit, s = cv.fit$lambda.min)
+
+# #Run multiple times and average error curves for robustness
+# MSEs <- NULL
+# for (i in 1:100){
+#                  cv <- cv.glmnet(x, y, family="cox",standardize = F)
+#                  MSEs <- cbind(MSEs, cv$cvm)
+#              }
+# rownames(MSEs) <- cv$lambda
+# lambda.min <- as.numeric(names(which.min(rowMeans(MSEs))))
+# fit <-glmnet(x, y, family="cox",standardize = F)
+# Coefficients <- coef(fit, s = lambda.min)
+
+#Extract model output
+td_coef = as.data.table(tidy(Coefficients))
+td_coef = td_coef[order(value),]
+td_coef$row = factor(td_coef$row,levels = td_coef$row)
+colnames(td_coef) = c("celltype","column","coef")
+
+cur_cols = rbind(tcols,data.table(tumor_cols = rep("black",length(c(unique(surv_dat$Grade),unique(surv_dat$Mol_Signature),unique(surv_dat$pN_4gr)))),cluster = c(paste0("Grade",unique(surv_dat$Grade)),paste0("Mol_Signature",unique(surv_dat$Mol_Signature)),paste0("pN_4gr",unique(surv_dat$pN_4gr)))))
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = celltype, y = exp(coef), color = celltype)) +
+geom_point(size = 4) +
+scale_color_manual(values = cur_cols[order(match(cluster,levels(td_coef$celltype))),]$tumor_cols)+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')+
+theme(axis.text.y = element_text(color = cur_cols[order(match(cluster,levels(td_coef$celltype))),]$tumor_cols))
+
+```
+
+Survival model based on presence of phenotype clusters in LN mets
+```{r survival cluster presence met}
+#Extract cluster numbers in LN mets
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,] #exclude sizeflagged cells
+met[,test := .N,by = "PID"]
+met = met[test >=100,] #exclude images with less than 100 tumor cells (this was accidentally missed in version before but makes little difference: just adds a few more less stratifying clusters)
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",fun.aggregate = length)
+
+#Convert to binary (1 = cluster present, 0 = not present; threshold for presence: at least 5 cells)
+binm = met[,-"PID"]
+binm[binm < 5] = 0
+binm[binm >= 5] = 1
+binm$PID = met$PID
+
+#Get survival info and clinical classifications
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Grade","Mol_Signature","pN_4gr")]))
+
+#Remove uncertain clinical classifications
+add$Mol_Signature[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$Mol_Signature[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add = unique(add)
+surv_dat = merge(surv_dat,add,by = "PID",all.x = T)
+
+#Merge with binary cluster presences
+surv_dat = merge(surv_dat,binm,by = "PID")
+
+#Clean and set refrerence levels for nodal status (#NULL! and 7 both mean NA)
+surv_dat[pN_4gr == "pN0",pN_4gr := "#NULL!"]#these are patients with LN met samples
+surv_dat[is.na(pN_4gr),pN_4gr := "#NULL!"]
+surv_dat[pN_4gr == "7",pN_4gr := "#NULL!"]
+surv_dat[,pN_4gr := factor(pN_4gr,levels = c("pN1","pN2","pN3","#NULL!"))]
+
+#Clean and set refrerence levels for grade (#NULL! and 4 both mean NA)
+surv_dat[is.na(Grade),Grade := "#NULL!"]
+surv_dat[Grade == "4",Grade := "#NULL!"]
+surv_dat[,Grade := factor(Grade,levels = c("G3","G2","G1","#NULL!"))]
+
+#Clean and set refrerence levels for molecular subtype (#NULL! means NA)
+surv_dat[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+surv_dat[,Mol_Signature := factor(Mol_Signature,levels = c("Luminal A","Luminal B (HER2-)","Luminal B (HER2+)","HER2","Triple negative","#NULL!"))]
+
+#Use lasso-regularized coxph model to find clusters in LN mets/ clinical features that stratify patients according to survival
+x_grade <- model.matrix( ~ .-1, surv_dat[,c("Grade","pN_4gr","Mol_Signature")])
+x = cbind(as.matrix(surv_dat[,-c("PID","OS","Livestatus1censored","censoring","Grade","pN_4gr","Mol_Signature")]),x_grade)
+y = Surv(surv_dat$OS, surv_dat$censoring)
+
+#Use standardize = F because predictors are categorical
+cv.fit <- cv.glmnet(x, y, family="cox",standardize = F)
+fit <-glmnet(x, y, family="cox",standardize = F)
+plot(cv.fit)
+Coefficients <- coef(fit, s = cv.fit$lambda.min)
+
+#Average error curves to increase robustness
+MSEs <- NULL
+for (i in 1:500){
+                 cv <- cv.glmnet(x, y, family="cox",standardize = F)
+                 MSEs <- cbind(MSEs, cv$cvm)
+             }
+rownames(MSEs) <- cv$lambda
+lambda.min <- as.numeric(names(which.min(rowMeans(MSEs))))
+fit <-glmnet(x, y, family="cox",standardize = F)
+Coefficients <- coef(fit, s = lambda.min)
+
+#Extract model output -> non-zero features
+td_coef_met = as.data.table(tidy(Coefficients))
+td_coef_met = td_coef_met[order(value),]
+td_coef_met$row = factor(td_coef_met$row,levels = td_coef_met$row)
+colnames(td_coef_met) = c("celltype","column","coef")
+
+#Use a color map that keeps the clinical features in black but has the cell type colors
+cur_cols = rbind(tcols,data.table(tumor_cols = rep("black",length(c(unique(surv_dat$Grade),unique(surv_dat$Mol_Signature),unique(surv_dat$pN_4gr)))),cluster = c(paste0("Grade",unique(surv_dat$Grade)),paste0("Mol_Signature",unique(surv_dat$Mol_Signature)),paste0("pN_4gr",unique(surv_dat$pN_4gr)))))
+
+#Visualize hazard ratios of non-zero features
+ggplot(td_coef_met, aes(x = celltype, y = exp(coef), color = celltype)) +
+geom_point(size = 4) +
+scale_color_manual(values = cur_cols[order(match(cluster,levels(td_coef_met$celltype))),]$tumor_cols)+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')+
+theme(axis.text.y = element_text(color = cur_cols[order(match(cluster,levels(td_coef_met$celltype))),]$tumor_cols))
+
+```
+
+Combine the above with heterogeneity measure - does it improve model?
+```{r}
+#Calculate cluster numbers in LN mets and overall heterogeneity (as later on in pipeline 2)
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=100,]
+met = unique(met[,c("PID","tumor_cluster_100","ncells")])
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",fill =0)
+met$entropy = apply(as.matrix(met[,-"PID"]),1,entropy.ChaoShen)
+met = unique(met[,c("PID","entropy")])
+
+#Use only relevant predcitors from model above
+surv_dat = surv_dat[,c("PID","OS","censoring","Grade",na.omit(as.numeric(as.character(td_coef_met$celltype)))),with =F]
+surv_dat = merge(surv_dat,met,by = "PID")
+
+res.cox1 <- coxph(Surv(surv_dat$OS, surv_dat$censoring) ~ ., data =  surv_dat[,-c("PID","entropy")])
+summary(res.cox1)
+
+res.cox2 <- coxph(Surv(surv_dat$OS, surv_dat$censoring) ~ ., data =  surv_dat[,-"PID"])
+summary(res.cox2)
+
+anova(res.cox1,res.cox2)
+
+```
+
+Same as above but with metaclusters instead of tumor_cluster_100
+```{r survival cluster presence met metaclusters}
+#Extract cluster numbers in LN mets
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','metaclusters','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,] #exclude sizeflagged cells
+met[,test := .N,by = "PID"]
+met = met[test >=100,] #exclude images with less than 100 tumor cells
+met = dcast.data.table(met,"PID ~ metaclusters",fun.aggregate = length)
+
+#Convert to binary (1 = cluster present, 0 = not present; threshold for presence: at least 5 cells)
+binm = met[,-"PID"]
+binm[binm < 5] = 0
+binm[binm >= 5] = 1
+binm$PID = met$PID
+
+#Get survival info and clinical classifications
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Grade","Mol_Signature","pN_4gr")]))
+
+#Remove uncertain clinical classifications
+add$Mol_Signature[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$Mol_Signature[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add = unique(add)
+surv_dat = merge(surv_dat,add,by = "PID",all.x = T)
+
+#Merge with binary cluster presences
+surv_dat = merge(surv_dat,binm,by = "PID")
+
+#Clean and set refrerence levels for nodal status (#NULL! and 7 both mean NA)
+surv_dat[pN_4gr == "pN0",pN_4gr := "#NULL!"]#these are patients with LN met samples
+surv_dat[is.na(pN_4gr),pN_4gr := "#NULL!"]
+surv_dat[pN_4gr == "7",pN_4gr := "#NULL!"]
+surv_dat[,pN_4gr := factor(pN_4gr,levels = c("pN1","pN2","pN3","#NULL!"))]
+
+#Clean and set refrerence levels for grade (#NULL! and 4 both mean NA)
+surv_dat[is.na(Grade),Grade := "#NULL!"]
+surv_dat[Grade == "4",Grade := "#NULL!"]
+surv_dat[,Grade := factor(Grade,levels = c("G3","G2","G1","#NULL!"))]
+
+#Clean and set refrerence levels for molecular subtype (#NULL! means NA)
+surv_dat[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+surv_dat[,Mol_Signature := factor(Mol_Signature,levels = c("Luminal A","Luminal B (HER2-)","Luminal B (HER2+)","HER2","Triple negative","#NULL!"))]
+
+#Use lasso-regularized coxph model to find clusters in LN mets/ clinical features that stratify patients according to survival
+x_grade <- model.matrix( ~ .-1, surv_dat[,c("Grade","pN_4gr","Mol_Signature")])
+x = cbind(as.matrix(surv_dat[,-c("PID","OS","Livestatus1censored","censoring","Grade","pN_4gr","Mol_Signature")]),x_grade)
+y = Surv(surv_dat$OS, surv_dat$censoring)
+
+#Use standardize = F because predictors are categorical
+cv.fit <- cv.glmnet(x, y, family="cox",standardize = F)
+fit <-glmnet(x, y, family="cox",standardize = F)
+plot(cv.fit)
+Coefficients <- coef(fit, s = cv.fit$lambda.min)
+
+#Average error curves to increase robustness
+MSEs <- NULL
+for (i in 1:500){
+                 cv <- cv.glmnet(x, y, family="cox",standardize = F)
+                 MSEs <- cbind(MSEs, cv$cvm)
+             }
+rownames(MSEs) <- cv$lambda
+lambda.min <- as.numeric(names(which.min(rowMeans(MSEs))))
+fit <-glmnet(x, y, family="cox",standardize = F)
+Coefficients <- coef(fit, s = lambda.min)
+
+#Extract model output -> non-zero features
+td_coef = as.data.table(tidy(Coefficients))
+td_coef = td_coef[order(value),]
+td_coef$row = factor(td_coef$row,levels = td_coef$row)
+colnames(td_coef) = c("celltype","column","coef")
+
+#Use a color map that keeps the clinical features in black but has the cell type colors
+cur_cols = rbind(metacols,data.table(col = rep("black",length(c(unique(surv_dat$Grade),unique(surv_dat$Mol_Signature),unique(surv_dat$pN_4gr)))),meta = c(paste0("Grade",unique(surv_dat$Grade)),paste0("Mol_Signature",unique(surv_dat$Mol_Signature)),paste0("pN_4gr",unique(surv_dat$pN_4gr)))))
+
+#Visualize hazard ratios of non-zero features
+ggplot(td_coef, aes(x = celltype, y = exp(coef), color = celltype)) +
+geom_point(size = 4) +
+scale_color_manual(values = cur_cols[order(match(meta,levels(td_coef$celltype))),]$col)+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')+
+theme(axis.text.y = element_text(color = cur_cols[order(match(meta,levels(td_coef$celltype))),]$col))
+```
+
+Survival model based on presence of phenotype clusters in primary tumors
+```{r survival cluster presence primary}
+#Extract cluster numbers in primary tumors
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=100,]
+primary = dcast.data.table(primary,"PID ~ tumor_cluster_100",fun.aggregate = length)
+
+#Convert to binary (1 = cluster present, 0 = not present; threshold for presence: at least 5 cells)
+binp = primary[,-"PID"]
+binp[binp < 5] = 0
+binp[binp >= 5] = 1
+binp$PID = primary$PID
+colnames(binp)[colnames(binp) != "PID"] = paste0('cluster_',colnames(binp)[colnames(binp) != "PID"])
+
+#Get survival info and clinical classifications
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Grade","Mol_Signature","pN_4gr")]))
+
+#Remove uncertain clinical classifications
+add$Mol_Signature[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$Mol_Signature[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add = unique(add)
+surv_dat = merge(surv_dat,add,by = "PID",all.x = T)
+surv_dat = merge(surv_dat,binp,by = "PID")
+
+#Clean and set refrerence levels for nodal status (#NULL! and 7 both mean NA)
+surv_dat[pN_4gr == "pN0",pN_4gr := "#NULL!"]#these are patients with LN met samples
+surv_dat[is.na(pN_4gr),pN_4gr := "#NULL!"]
+surv_dat[pN_4gr == "7",pN_4gr := "#NULL!"]
+surv_dat[,pN_4gr := factor(pN_4gr,levels = c("pN1","pN2","pN3","#NULL!"))]
+
+#Clean and set refrerence levels for grade (#NULL! and 4 both mean NA)
+surv_dat[is.na(Grade),Grade := "#NULL!"]
+surv_dat[Grade == "4",Grade := "#NULL!"]
+surv_dat[,Grade := factor(Grade,levels = c("G3","G2","G1","#NULL!"))]
+
+#Clean and set refrerence levels for molecular subtype (#NULL! means NA)
+surv_dat[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+surv_dat[,Mol_Signature := factor(Mol_Signature,levels = c("Luminal A","Luminal B (HER2-)","Luminal B (HER2+)","HER2","Triple negative","#NULL!"))]
+
+#Use lasso-regularized coxph
+x_grade <- model.matrix( ~ .-1, surv_dat[,c("Grade","pN_4gr","Mol_Signature")])
+x = cbind(as.matrix(surv_dat[,-c("PID","OS","Livestatus1censored","censoring","Grade","pN_4gr","Mol_Signature")]),x_grade)
+y = Surv(surv_dat$OS, surv_dat$censoring)
+
+#Use standardize = F because predictors are categorical
+cv.fit <- cv.glmnet(x, y, family="cox",standardize = F)
+fit <-glmnet(x, y, family="cox",standardize = F)
+plot(cv.fit)
+Coefficients <- coef(fit, s = cv.fit$lambda.min)
+
+# #Robuster
+# MSEs <- NULL
+# for (i in 1:500){
+#                  cv <- cv.glmnet(x, y, family="cox",standardize = F)
+#                  MSEs <- cbind(MSEs, cv$cvm)
+#              }
+# rownames(MSEs) <- cv$lambda
+# lambda.min <- as.numeric(names(which.min(rowMeans(MSEs))))
+# fit <-glmnet(x, y, family="cox",standardize = F)
+# Coefficients <- coef(fit, s = lambda.min)
+
+#Extract non-zero coefficients
+td_coef = as.data.table(tidy(Coefficients))
+td_coef$row = sub("cluster_","",td_coef$row)
+td_coef = td_coef[order(value),]
+td_coef$row = factor(td_coef$row,levels = td_coef$row)
+colnames(td_coef) = c("celltype","column","coef")
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = celltype, y = exp(coef), color = celltype)) +
+geom_point(size = 4) +
+scale_color_manual(values = cur_cols[order(match(cluster,levels(td_coef$celltype))),]$tumor_cols)+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')+
+theme(axis.text.y = element_text(color = cur_cols[order(match(cluster,levels(td_coef$celltype))),]$tumor_cols))
+
+```
+
+Survival model based on densities of  phenotype clusters in LN mets
+```{r survival cluster density met}
+#Extract cluster densities in LN mets
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag',"AreaTissue")],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('core', 'tumor_cluster_100')]
+met[,test := .N,by = "core"]
+met = met[test >=100,]
+met[,density_core := ncells/AreaTissue,by = c("core","tumor_cluster_100")]
+met = unique(met[,c("PID","core","tumor_cluster_100","density_core")])
+met[,density_PID := mean(density_core),by = c("PID","tumor_cluster_100")]
+met = unique(met[,c("PID","density_PID","tumor_cluster_100")])
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",value.var = "density_PID",fill = 0)
+
+#Change unit so the density values are well above 1 (setting zeros to 1 after so they will be zeros again after log, zeros represent complete absence of a community type -> should stay zero)
+met = cbind(met[,"PID",with = F],data.table(as.matrix(met[,-"PID",with = F]) * 10000000))
+
+#log transform density values
+bin = met[,-"PID",with = F]
+bin = log1p(bin)
+# bin[bin == 0] = 1
+# bin = log(bin)
+met = cbind(met[,"PID",with = F],bin)
+
+#Add survival and clinical info
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Grade","Mol_Signature","pN_4gr")]))
+add$Mol_Signature[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$Mol_Signature[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add = unique(add)
+surv_dat = merge(surv_dat,add,by = "PID",all.x = T)
+surv_dat = merge(met,surv_dat,by = "PID")
+
+#Clean and set refrerence levels for nodal status (#NULL! and 7 both mean NA)
+surv_dat[pN_4gr == "pN0",pN_4gr := "#NULL!"]#these are patients with LN met samples
+surv_dat[is.na(pN_4gr),pN_4gr := "#NULL!"]
+surv_dat[pN_4gr == "7",pN_4gr := "#NULL!"]
+surv_dat[,pN_4gr := factor(pN_4gr,levels = c("pN1","pN2","pN3","#NULL!"))]
+
+#Clean and set refrerence levels for grade (#NULL! and 4 both mean NA)
+surv_dat[is.na(Grade),Grade := "#NULL!"]
+surv_dat[Grade == "4",Grade := "#NULL!"]
+surv_dat[,Grade := factor(Grade,levels = c("G3","G2","G1","#NULL!"))]
+
+#Clean and set refrerence levels for molecular subtype (#NULL! means NA)
+surv_dat[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+surv_dat[,Mol_Signature := factor(Mol_Signature,levels = c("Luminal A","Luminal B (HER2-)","Luminal B (HER2+)","HER2","Triple negative","#NULL!"))]
+
+#Lasso-regularized coxph
+x_grade <- model.matrix( ~ .-1, surv_dat[,c("Grade","pN_4gr","Mol_Signature")])
+x = cbind(as.matrix(surv_dat[,-c("PID","OS","Livestatus1censored","censoring","Grade","pN_4gr","Mol_Signature")]),x_grade)
+y = Surv(surv_dat$OS, surv_dat$censoring)
+
+#Standardize = T is the default
+cv.fit <- cv.glmnet(x, y, family="cox")
+fit <-glmnet(x, y, family="cox")
+plot(cv.fit)
+Coefficients <- coef(fit, s = cv.fit$lambda.min)
+
+# #Robuster
+# MSEs <- NULL
+# for (i in 1:500){
+#                  cv <- cv.glmnet(x, y, family="cox")
+#                  MSEs <- cbind(MSEs, cv$cvm)
+#              }
+# rownames(MSEs) <- cv$lambda
+# lambda.min <- as.numeric(names(which.min(rowMeans(MSEs))))
+# fit <-glmnet(x, y, family="cox")
+# Coefficients <- coef(fit, s = lambda.min)
+
+#Extract non-zero coefficients
+td_coef = as.data.table(tidy(Coefficients))
+td_coef = td_coef[order(value),]
+td_coef$row = factor(td_coef$row,levels = td_coef$row)
+colnames(td_coef) = c("celltype","column","coef")
+
+cur_cols = rbind(tcols,data.table(tumor_cols = rep("black",length(c(unique(surv_dat$Grade),unique(surv_dat$Mol_Signature),unique(surv_dat$pN_4gr)))),cluster = c(paste0("Grade",unique(surv_dat$Grade)),paste0("Mol_Signature",unique(surv_dat$Mol_Signature)),paste0("pN_4gr",unique(surv_dat$pN_4gr)))))
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = celltype, y = exp(coef), color = celltype)) +
+geom_point(size = 4) +
+scale_color_manual(values = cur_cols[order(match(cluster,levels(td_coef$celltype))),]$tumor_cols)+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')+
+theme(axis.text.y = element_text(color = cur_cols[order(match(cluster,levels(td_coef$celltype))),]$tumor_cols))
+
+```
+
+Survival model based on densities of phenotype clusters in primary tumors
+```{r survival cluster density primary}
+#Primary tumor cluster densities
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag',"AreaTissue")],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('core', 'tumor_cluster_100')]
+primary[,test := .N,by = "core"]
+primary = primary[test >=100,]
+primary[,density_core := ncells/AreaTissue,by = c("core","tumor_cluster_100")]
+primary = unique(primary[,c("PID","core","tumor_cluster_100","density_core")])
+primary[,density_PID := mean(density_core),by = c("PID","tumor_cluster_100")]
+primary = unique(primary[,c("PID","density_PID","tumor_cluster_100")])
+primary = dcast.data.table(primary,"PID ~ tumor_cluster_100",value.var = "density_PID",fill = 0)
+
+#Change Unit so the density values are well above 1 (setting zeros to 1 after so they will be zeros again after log, zeros represent complete absence of a community type -> should stay zero)
+primary = cbind(primary[,"PID",with = F],data.table(as.matrix(primary[,-"PID",with = F]) * 10000000))
+
+#log transform density values
+bin = primary[,-"PID",with = F]
+bin = log1p(bin)
+# bin[bin == 0] = 1
+# bin = log(bin)
+primary = cbind(primary[,"PID",with = F],bin)
+colnames(primary)[colnames(primary) != "PID"] = paste0('cluster_',colnames(primary)[colnames(primary) != "PID"])
+
+#Add survival and clinical info
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Grade","Mol_Signature","pN_4gr")]))
+add$Mol_Signature[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$Mol_Signature[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add = unique(add)
+surv_dat = merge(surv_dat,add,by = "PID",all.x = T)
+surv_dat = merge(surv_dat,primary,by = "PID")
+
+#Clean and set refrerence levels for nodal status (#NULL! and 7 both mean NA)
+surv_dat[pN_4gr == "pN0",pN_4gr := "#NULL!"]#these are patients with LN met samples
+surv_dat[is.na(pN_4gr),pN_4gr := "#NULL!"]
+surv_dat[pN_4gr == "7",pN_4gr := "#NULL!"]
+surv_dat[,pN_4gr := factor(pN_4gr,levels = c("pN1","pN2","pN3","#NULL!"))]
+
+#Clean and set refrerence levels for grade (#NULL! and 4 both mean NA)
+surv_dat[is.na(Grade),Grade := "#NULL!"]
+surv_dat[Grade == "4",Grade := "#NULL!"]
+surv_dat[,Grade := factor(Grade,levels = c("G3","G2","G1","#NULL!"))]
+
+#Clean and set refrerence levels for molecular subtype (#NULL! means NA)
+surv_dat[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+surv_dat[,Mol_Signature := factor(Mol_Signature,levels = c("Luminal A","Luminal B (HER2-)","Luminal B (HER2+)","HER2","Triple negative","#NULL!"))]
+
+#Lasso-regularized coxph
+x_grade <- model.matrix( ~ .-1, surv_dat[,c("Grade","pN_4gr","Mol_Signature")])
+x = cbind(as.matrix(surv_dat[,-c("PID","OS","Livestatus1censored","censoring","Grade","pN_4gr","Mol_Signature")]),x_grade)
+y = Surv(surv_dat$OS, surv_dat$censoring)
+
+#standardize = T is the default
+cv.fit <- cv.glmnet(x, y, family="cox")
+fit <-glmnet(x, y, family="cox")
+plot(cv.fit)
+Coefficients <- coef(fit, s = cv.fit$lambda.min)
+
+# #Robuster
+# MSEs <- NULL
+# for (i in 1:500){
+#                  cv <- cv.glmnet(x, y, family="cox")
+#                  MSEs <- cbind(MSEs, cv$cvm)
+#              }
+# rownames(MSEs) <- cv$lambda
+# lambda.min <- as.numeric(names(which.min(rowMeans(MSEs))))
+# fit <-glmnet(x, y, family="cox")
+# Coefficients <- coef(fit, s = lambda.min)
+
+#Extract non-zeros
+td_coef = as.data.table(tidy(Coefficients))
+td_coef$row = sub("cluster_","",td_coef$row)
+td_coef = td_coef[order(value),]
+td_coef$row = factor(td_coef$row,levels = td_coef$row)
+colnames(td_coef) = c("celltype","column","coef")
+
+cur_cols = rbind(tcols,data.table(tumor_cols = rep("black",length(c(unique(surv_dat$Grade),unique(surv_dat$Mol_Signature),unique(surv_dat$pN_4gr)))),cluster = c(paste0("Grade",unique(surv_dat$Grade)),paste0("Mol_Signature",unique(surv_dat$Mol_Signature)),paste0("pN_4gr",unique(surv_dat$pN_4gr)))))
+
+#Visualize hazard ratios
+ggplot(td_coef, aes(x = celltype, y = exp(coef), color = celltype)) +
+geom_point(size = 4) +
+scale_color_manual(values = cur_cols[order(match(cluster,levels(td_coef$celltype))),]$tumor_cols)+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')+
+scale_y_continuous(trans='log')+
+theme(axis.text.y = element_text(color = cur_cols[order(match(cluster,levels(td_coef$celltype))),]$tumor_cols))
+
+```
+
+Predict presence/absence of survival-associated phenotype clusters in LN met with presence/absence of clusters in primaries
+```{r predict met clusters based on primary}
+#Primary presences of clusters
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=100,]
+primary = dcast.data.table(primary,"PID ~ tumor_cluster_100",fun.aggregate = length)
+binp = primary[,-"PID"]
+binp[binp < 5] = 0
+binp[binp >= 5] = 1
+binp$PID = primary$PID
+
+#LN met presences of clusters
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,test := .N,by = "PID"]
+met = met[test >=100,]
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",fun.aggregate = length)
+binm = met[,-"PID"]
+binm[binm < 5] = 0
+binm[binm >= 5] = 1
+binm$PID = met$PID
+
+#Use only patients with matched samples of primary and LN met
+binp = binp[PID %in% binm$PID,]
+binm = binm[PID %in% binp$PID,]
+binm = binm[order(match(PID,binp$PID))]
+
+#Loop through all clusters in LN mets that are associated with survival and see which primary tumor clusters predict them (lasso-regularized logistic regression)
+Coefficients = list()
+for (i in na.omit(as.numeric(as.character(td_coef_met$celltype)))){
+  Y = as.vector(as.matrix(binm[,as.character(i),with = F]))
+  if (sum(Y)> 10){
+    
+    #Average error curves for more robustness
+    MSEs <- NULL
+    for (j in 1:100){
+                     cv.fit = cv.glmnet(as.matrix(binp[,-"PID"]),as.factor(Y),family = "binomial",nfold = 10,alpha = 1,standardize = F)
+                     MSEs <- cbind(MSEs, cv.fit$cvm)
+                 }
+    rownames(MSEs) <- cv.fit$lambda
+    lambda.min <- as.numeric(names(which.min(rowMeans(MSEs))))
+    fit = glmnet(as.matrix(binp[,-"PID"]),as.factor(Y),family = "binomial",nfold = 10,alpha = 1,standardize = F)
+    nonz <- coef(fit, s = lambda.min)
+    out = as.data.table(nonz@Dimnames[[1]][which(nonz != 0 ) ])
+    names(out) = "predictors"
+    out$betas = nonz[which(nonz != 0 ) ]
+    out$CTmet = i
+    Coefficients[[i]] = out
+  }
+}
+
+CTpred = do.call(rbind,Coefficients)
+CTpred = CTpred[predictors != "(Intercept)",]
+CTpred = CTpred[order(CTmet,betas),]
+
+#Visualize betas
+par(mfrow(4,1))
+for (i in unique(CTpred$CTmet)){
+  cur = CTpred[CTmet == i,]
+  cur$predictors = factor(cur$predictors,levels = cur$predictors)
+  
+  plot(ggplot(cur,aes(x = predictors,y = betas,fill = predictors))+
+  geom_bar(stat = "identity")+
+    scale_fill_manual(values = tcols[order(match(cluster,levels(cur$predictors)))]$tumor_cols))
+}
+
+```
+
+LN mets with good/bad prognosis clusters (survival curves and clinical compositions)
+```{r good vs bad prognosis mets}
+#Extract LN met cluster presences
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,test := .N,by = "PID"]
+met = met[test >=100,]
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",fun.aggregate = length)
+binm = met[,-"PID"]
+binm[binm < 5] = 0
+binm[binm >= 5] = 1
+binm$PID = met$PID
+
+#Good prognosis and bad prognosis clusters
+good_prog = na.omit(as.numeric(as.character(td_coef_met[coef < 0,]$celltype)))
+bad_prog = na.omit(as.numeric(as.character(td_coef_met[coef > 0,]$celltype)))
+
+# #Original version
+# good_prog = c(50,9,23,34)
+# bad_prog = 29
+
+#Get survival info
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+#Version with exclusively good or bad clusters present
+bin_good = binm[,c(as.character(c(good_prog,bad_prog)),"PID"),with = F]
+bin_good[`29` & !(`50`| `9` | `23` | `34` ),progn := "bad"]
+bin_good[(`50`| `9` | `23` | `34` )& !`29`,progn := "good"]
+# bin_good[`9` & !`29`  ,progn := "bad"]
+# bin_good[is.na(progn),progn := "rest"]
+bin_good = bin_good[!is.na(progn),]
+bin_good = merge(surv_dat,bin_good,by = "PID")
+
+#Calc curves
+SurvObj <- Surv(bin_good$OS, bin_good$censoring)
+km.as.groups <- survfit(SurvObj ~ bin_good$progn)
+km.as.one <- survfit(SurvObj ~ 1)
+
+ggplot(tidy(km.as.groups), aes(time, estimate, group = strata)) +
+    geom_line(aes(color = strata)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .25)+
+  ylim(0,1)
+
+#Nodal status
+ln = unique(as.data.table(as.data.table(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','pN_4gr')])))
+ln = merge(bin_good,ln,by = "PID")
+ln[pN_4gr == "pN0",pN_4gr := "pN1"] #These are patients with LN met samples
+ln[,n := .N,by = c("progn","pN_4gr")]
+ln[,frac := n/.N,by = "progn"]
+ln = unique(ln[,c("progn","pN_4gr","n")])
+
+ggplot(ln,aes(y = n,fill = factor(pN_4gr,levels = c("7","pN3","pN2","pN1")),x = as.factor(1)))+
+  geom_bar(stat = "identity")+
+  scale_fill_grey()+
+  theme(aspect.ratio = 2)+
+  facet_wrap(~progn,scales = "free")
+
+#Molecular subtype
+ln = unique(as.data.table(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','Mol_Signature')])))
+ln = merge(bin_good,ln,by = "PID",all.x = T)
+ln[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+ln[,n := .N,by = c("progn","Mol_Signature")]
+ln[,frac := n/.N,by = "progn"]
+ln = unique(ln[,c("progn","Mol_Signature","n")])
+ln$Mol_Signature = factor(ln$Mol_Signature, levels = rev(c("Luminal A","Luminal B (HER2-)","Luminal B (HER2+)","HER2","Triple negative","#NULL!")))
+
+ggplot(ln,aes(y = n,fill = Mol_Signature,x = as.factor(1)))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = cols_mol[order(match(Mol_Signature,levels(ln$Mol_Signature))),]$col)+
+  theme(aspect.ratio = 2)+
+  theme_bw()+
+  facet_wrap(~progn,scales = "free")
+
+
+#Version only considering clusters 9 and 29
+bin_good = binm[,c(as.character(c(good_prog,bad_prog)),"PID"),with = F]
+bin_good[`29` & !( `9` ),progn := "bad"]
+#bin_good[`29` == 1 ,progn := "bad"] #Use this for 29 + both
+bin_good[is.na(progn),progn := "rest"]
+bin_good = bin_good[!is.na(progn),]
+pids_met = bin_good[,c("PID","progn")]
+bin_good = merge(surv_dat,bin_good,by = "PID")
+
+#Calc curves
+SurvObj <- Surv(bin_good$OS, bin_good$censoring)
+km.as.groups <- survfit(SurvObj ~ bin_good$progn)
+km.as.one <- survfit(SurvObj ~ 1)
+
+ggplot(tidy(km.as.groups), aes(time, estimate, group = strata)) +
+    geom_line(aes(color = strata)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .25)+
+  ylim(0,1)
+
+```
+
+Presence of cluster 9 and 29 in node positive or node negative primaries (survival curves)
+```{r 9 and 29 in node pos vs node neg}
+#Extract survival data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+
+#Extract primary cluster presences for only node positive patients and exclude triple negative patients
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor" & pN_4gr %in% c("pN1","pN2","pN3")))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor" & pN_4gr %in% c("pN1","pN2","pN3"))))) #remove TNBC for other plot
+primary = primary[sizeflag != 1,]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=20,]
+primary = dcast.data.table(primary,"PID ~ tumor_cluster_100",fun.aggregate = length)
+binp_np = primary[,-"PID"]
+binp_np[binp_np < 5] = 0
+binp_np[binp_np >= 5] = 1
+binp_np$PID = primary$PID
+
+#Compare patients with cluster 29 but not 9 to the rest
+bin_good = binp_np[,c(as.character(c(good_prog,bad_prog)),"PID"),with = F]
+bin_good[`9` & !`29`  ,progn := "bad"]
+bin_good[is.na(progn),progn := "rest"]
+#bin_good = bin_good[!is.na(progn),]
+bin_good = merge(surv_dat,bin_good,by = "PID")
+
+#Calc curves
+SurvObj <- Surv(bin_good$OS, bin_good$censoring)
+km.as.groups <- survfit(SurvObj ~ bin_good$progn)
+km.as.one <- survfit(SurvObj ~ 1)
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/only9_nodepos_primaries")
+ggplot(tidy(km.as.groups), aes(time, estimate, group = strata)) +
+    geom_line(aes(color = strata)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .25)+
+  ylim(0,1)
+dev.off()
+
+
+#Extract primary cluster presences for only node negative patients (run either this or above)
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor" & pN_4gr %in% c("pN0")))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor" & pN_4gr %in% c("pN0")))))
+primary = primary[sizeflag != 1,]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=100,]
+primary = dcast.data.table(primary,"PID ~ tumor_cluster_100",fun.aggregate = length)
+binp = primary[,-"PID"]
+binp[binp < 5] = 0
+binp[binp >= 5] = 1
+binp$PID = primary$PID
+
+#Compare patients with cluster 29 but not 9 to the rest
+bin_good = binp[,c(as.character(c(good_prog,bad_prog)),"PID"),with = F]
+bin_good[`9` & !`29`  ,progn := "bad"]
+bin_good[is.na(progn),progn := "rest"]
+#bin_good = bin_good[!is.na(progn),]
+bin_good = merge(surv_dat,bin_good,by = "PID")
+
+#Calc curves
+SurvObj <- Surv(bin_good$OS, bin_good$censoring)
+km.as.groups <- survfit(SurvObj ~ bin_good$progn)
+km.as.one <- survfit(SurvObj ~ 1)
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/only9_nodeneg_primaries")
+ggplot(tidy(km.as.groups), aes(time, estimate, group = strata)) +
+    geom_line(aes(color = strata)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .25)+
+  ylim(0,1)
+dev.off()
+
+```
+
+Flowdiagram for presence/absence of 9 and 29 in primaries and mets
+```{r flowdiagram 9 and 29}
+#Met presences
+met = binm[,c("PID","29","9"),with = F]
+met[`29` == 1 & `9` == 0,grps_met := "only29"]
+met[`29` == 0 & `9` == 1,grps_met := "only9"]
+met[`29` == 1 & `9` == 1,grps_met := "both"]
+met[`29` == 0 & `9` == 0,grps_met := "none"]
+
+#Primary presences
+prim = binp_np[,c("PID","29","9"),with = F]
+prim[`29` == 1 & `9` == 0,grps_prim := "only29"]
+prim[`29` == 0 & `9` == 1,grps_prim := "only9"]
+prim[`29` == 1 & `9` == 1,grps_prim := "both"]
+prim[`29` == 0 & `9` == 0,grps_prim := "none"]
+
+#Combine and prepare for flow diagram
+comb = merge(prim,met,by = "PID", all.x = T)
+comb[is.na(grps_met),grps_met := "no_met_sample"]
+comb[,Freq := .N,by = c("grps_prim","grps_met")]
+comb = unique(comb[,c("grps_prim","grps_met","Freq")])
+comb[,grps_prim := factor(grps_prim,levels = c("only9","both","only29","none"))]
+comb[,grps_met := factor(grps_met,levels = c("only9","both","only29","none","no_met_sample"))]
+cols_prim = c("orange3","orange4","cyan","gray")
+
+#Plot
+ggplot(comb,aes(y = Freq,
+           axis1 = grps_prim , axis3 = grps_met)) +
+  geom_flow(aes(fill = grps_prim)) +
+  scale_x_discrete(limits = c("grps_prim","grps_met")) +
+  scale_fill_manual(values = cols_prim)+
+  geom_stratum(fill = c(rev(cols_prim),c("white",rev(cols_prim))))+
+  geom_text(stat = "stratum", infer.label = TRUE)
+
+
+#Color bars with molecular subtype for next to flow diagram
+comb = merge(prim,met,by = "PID", all.x = T)
+comb[is.na(grps_met),grps_met := "no_met_sample"]
+
+#Add clinical subtype info
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Mol_Signature","Grade")]))
+add[duplicated(PID),Mol_Signature := "#NULL!"]
+add[duplicated(PID,fromLast = T),Mol_Signature := "#NULL!"]
+add[duplicated(PID,fromLast = F),Grade := "4"]
+add[duplicated(PID,fromLast = T),Grade := "4"]
+add = unique(add)
+mol = merge(comb,add,by = "PID",all.x = T)
+
+#Calculate proportions per ggalluvial group
+mol[,Freq := .N,by = c("grps_prim","grps_met","Mol_Signature")]
+mol[,grps_prim := factor(grps_prim,levels = c("only9","both","only29","none"))]
+mol[,grps_met := factor(grps_met,levels = c("only9","both","only29","none","no_met_sample"))]
+mol[,Mol_Signature := factor(Mol_Signature,c("HER2","Luminal B (HER2+)","Luminal A","Luminal B (HER2-)","Triple negative","#NULL!"))]
+mol[,Grade := factor(Grade,c("G1","G2","G3","4"))]
+mol = mol[order(grps_met,Mol_Signature),] #Exchange for grps_prim for side of primary tumors
+mol[,PID := factor(PID,levels = rev(PID))]
+
+#Plot
+ggplot(mol,aes(y = PID, fill = Mol_Signature))+geom_bar(stat = "count")+scale_fill_manual(values = cols_mol[order(match(Mol_Signature,levels(mol$Mol_Signature))),][1:6]$col)
+
+#Same with grade
+mol = mol[order(grps_prim,Grade),] #Exchange with grps_met for side of LN mets
+mol[,PID := factor(PID,levels = rev(PID))]
+
+#Plot
+ggplot(mol,aes(y = PID, fill = Grade))+geom_bar(stat = "count")+scale_fill_manual(values = cols_grade[order(match(Grade,levels(mol$Grade))),]$col)
+
+```
+
+Tumor cluster correlations between primary and LN met based on presence and absence of clusters
+```{r cluster correlation primary met presence}
+#Primary tumor cluster presences
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+# primary[,test := .N,by = "PID"]
+# primary = primary[test >=100,]
+
+#Absolute number of cells per cluster
+primary[,tot_cluster := .N, by = "tumor_cluster_100"]
+nr_bars = unique(primary[,c("tot_cluster","tumor_cluster_100")])
+primary = dcast.data.table(primary,"PID ~ tumor_cluster_100",fun.aggregate = length)
+binp = primary[,-"PID"]
+binp[binp < 5] = 0
+binp[binp >= 5] = 1
+binp$PID = primary$PID
+
+#Order according to cluster similarity (from cluster heatmap)
+binp = binp[,c("PID",row_order(h_clusters_tumor)),with = F]
+
+#LN met cluster presences
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+# met[,test := .N,by = "PID"]
+# met = met[test >=100,]
+
+#Absolute number of cells per cluster
+met[,tot_cluster := .N, by = "tumor_cluster_100"]
+nr_bars = unique(met[,c("tot_cluster","tumor_cluster_100")])
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",fun.aggregate = length)
+binm = met[,-"PID"]
+binm[binm < 5] = 0
+binm[binm >= 5] = 1
+binm$PID = met$PID
+
+#16 doesn't appear in mets, fill up with 0s
+binm$`16` = 0
+
+#Order according to cluster similarity
+binm = binm[,c("PID",row_order(h_clusters_tumor)),with = F]
+
+#Correlations between presence of clusters in primary and matched LN met
+binp = binp[PID %in% binm$PID,]
+binm = binm[PID %in% binp$PID,]
+
+#Order according to cluster similarity
+binp = binp[,c("PID",row_order(h_clusters_tumor)),with = F]
+binm = binm[,c("PID",row_order(h_clusters_tumor)),with = F]
+
+#Calculate correlations
+crosscor = cor(binp[,-"PID"],binm[,-"PID"])
+crosscor[is.na(crosscor)] = 0
+
+#Clustered heatmap
+ha_mix = HeatmapAnnotation(tumor = colnames(crosscor),
+    col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+t_met_prim_clustered = Heatmap(crosscor, name = "correlation",column_title = "tumor met primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha_mix)+
+  Heatmap(rownames(crosscor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+t_met_prim_clustered
+
+#Heatmap ordered according to cluster similarity
+t_met_prim = Heatmap(rownames(crosscor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  Heatmap(crosscor, name = "correlation",column_title = "tumor met primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,cluster_columns = F,top_annotation = ha_mix)+
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+t_met_prim
+
+
+#Order both axes according to met clustering
+crosscor = crosscor[column_order(t_met_prim_clustered)$correlation,]
+ord_met = Heatmap(crosscor, name = "correlation",column_title = "tumor met primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, cluster_rows = F,clustering_method_columns = "ward.D2",top_annotation = ha_mix)+
+  Heatmap(rownames(crosscor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+ord_met
+
+#Order both axes according to primary clustering
+crosscor = crosscor[,colnames(crosscor)[row_order(t_met_prim_clustered)]]
+ha_mix = HeatmapAnnotation(tumor = colnames(crosscor),
+    col = list(tumor = structure(tcols$tumor_cols,names = tcols$cluster)))
+ord_prim = Heatmap(crosscor, name = "correlation",column_title = "tumor met primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, cluster_columns = F,clustering_method_rows = "ward.D2",top_annotation = ha_mix)+
+  Heatmap(rownames(crosscor),col = structure(tcols$tumor_cols,names = tcols$cluster)) +
+  rowAnnotation(rn = anno_text(rownames(crosscor)))
+ord_prim
+
+```
+
+Heterogeneity: Primary vs LN met heterogeneity and association with survival
+```{r heterogeneity}
+#Calculate cluster numbers in LN mets
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=100,]
+met = unique(met[,c("PID","tumor_cluster_100","ncells")])
+met = dcast.data.table(met,"PID ~ tumor_cluster_100",fill =0)
+
+#Heterogeneities of all LN met samples
+met$entropy = apply(as.matrix(met[,-"PID"]),1,entropy.ChaoShen)
+
+#Survival info
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Grade","Mol_Signature","pN_4gr")]))
+add$Mol_Signature[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$Mol_Signature[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add = unique(add)
+surv_dat = merge(surv_dat,add,by = "PID",all.x = T)
+surv_dat = merge(surv_dat,met,by = "PID")
+
+#Divide LN mets into heterogeneity quartiles
+surv_dat[,grps := "low"]
+surv_dat[entropy >= quantile(entropy,0.25),grps := "medium"]
+surv_dat[entropy >= quantile(entropy,0.75),grps := "high"]
+surv_dat[,grps := factor(grps,levels = c("low","medium","high"))]
+
+#Calc survival curves for heterogeneity quartiles
+SurvObj <- Surv(surv_dat$OS, surv_dat$censoring)
+km.as.groups <- survfit(SurvObj ~ surv_dat$grps)
+km.as.one <- survfit(SurvObj ~ 1)
+
+#Plot survival curves
+count = 1
+par(mfrow=c(1,3))
+for (i in levels(surv_dat$grps)){
+  cur = unique(surv_dat$grps)[unique(surv_dat$grps) == i]
+  cur_dat = subset(surv_dat, surv_dat$grps == cur)
+  if (nrow(cur_dat) > 1){
+  SurvObj_cur <- Surv(cur_dat$OS, cur_dat$censoring)
+  km.cur.group <- survfit(SurvObj_cur ~ 1)
+  print(plot(km.cur.group,mark.time = T,col = c("red","lightblue","red")[count],xlim=range(1:500),cex = 1,lwd = 1))
+  par(new=TRUE)
+  print(plot(km.as.one,mark.time = T,col = "black",xlim=range(1:500),cex = 0.5,lwd = 0.5))
+  print(legend("bottomleft",1,cur,c("red","lightblue","red")[count], cex=3))}
+  count = count + 1
+}
+
+#Plot over each other
+ggplot(tidy(km.as.groups), aes(time, estimate, group = strata)) +
+    geom_line(aes(color = strata)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .25)+
+  ylim(0,1)
+
+#Correlate met heterogeneity with Ki67
+ki67 = data.table(PID = subset(sce_t,,TissueType == "lymph node mts")$PID, ki67 =counts(subset(sce_t,,TissueType == "lymph node mts"))["Er168_Ki-67",],pHH3 =counts(subset(sce_t,,TissueType == "lymph node mts"))["Eu153_Histone H3",])
+ki67[,avgKi67 := mean(ki67),by = "PID"]
+ki67[,avgpHH3 := mean(pHH3),by = "PID"]
+ki67 = unique(ki67[,c("PID","avgKi67","avgpHH3")])
+ki67 = merge(ki67,met[,c("PID","entropy")],by = "PID")
+
+ggplot(ki67,aes(x = entropy,y = avgKi67))+geom_point()+geom_smooth(method = lm) |
+ggplot(ki67,aes(x = entropy,y = avgpHH3))+geom_point()+geom_smooth(method = lm)
+
+
+#Set refrerence levels and clean clinical classifications
+surv_dat[pN_4gr == "pN0",pN_4gr := "#NULL!"]#Only in mets
+surv_dat[is.na(pN_4gr),pN_4gr := "#NULL!"]
+surv_dat[pN_4gr == "7",pN_4gr := "#NULL!"]
+surv_dat[,pN_4gr := factor(pN_4gr,levels = c("pN1","pN2","pN3","#NULL!"))]
+surv_dat[is.na(Grade),Grade := "#NULL!"]
+surv_dat[Grade == 4,Grade := "#NULL!"]
+surv_dat[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+surv_dat[,Grade := factor(Grade,levels = c("G3","G2","G1","#NULL!"))]
+surv_dat[,Mol_Signature := factor(Mol_Signature,levels = c("Luminal B (HER2-)","Luminal A","Luminal B (HER2+)","HER2","Triple negative","#NULL!"))]
+
+#Calculate coxph on LN met heterogeneities and all clinical classifications
+res.cox2 <- coxph(Surv(surv_dat$OS, surv_dat$censoring) ~ entropy + Grade + Mol_Signature + pN_4gr , data =  surv_dat)
+summary(res.cox2)
+
+#Extract hazard ratios and confidence intervals from model output
+CI = confint(res.cox2)
+dt <- data.table(x = names(res.cox2$coefficients),
+                 HR = exp(res.cox2$coefficients),
+                 L = exp(CI[,1]),
+                 U = exp(CI[,2]))
+
+#Sort by increasing hazard ratio
+dt = dt[order(HR),]
+
+#Association is significant if the CI of the hazard ratio does not include 1
+dt$sign = "non significant"
+dt$sign[dt$L < 1 & dt$U < 1] = "significant"
+dt$sign[dt$L > 1 & dt$U > 1] = "significant"
+dt$x = factor(dt$x,levels = dt$x)
+
+#Visualize hazard ratios
+p = ggplot(dt, aes(x = x, y = HR, color = sign)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = U, ymin = L))+
+scale_color_manual(values = c('lightblue','red'))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')
+p
+
+#Visualize heterogeneities per node status
+ggplot(surv_dat, aes(x = pN_4gr, y = entropy))+geom_boxplot()
+
+
+#Calculate cluster numbers in primary tumors
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=100,]
+primary = unique(primary[,c("PID","tumor_cluster_100","ncells")])
+primary = dcast.data.table(primary,"PID ~ tumor_cluster_100",fill =0)
+
+#Calculate shannon entropy of primary tumors only and check for association with survival
+primary$shannon_prim = apply(as.matrix(primary[,-"PID"]),1,entropy.ChaoShen)
+
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Grade","Mol_Signature","pN_4gr")]))
+add$Mol_Signature[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$Mol_Signature[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add = unique(add)
+surv_dat = merge(surv_dat,add,by = "PID",all.x = T)
+surv_dat = merge(surv_dat,primary,by = "PID")
+
+#Set refrerence levels and clean
+surv_dat[is.na(pN_4gr),pN_4gr := "#NULL!"]
+surv_dat[pN_4gr == "7",pN_4gr := "#NULL!"]
+surv_dat[,pN_4gr := factor(pN_4gr,levels = c("pN0","pN1","pN2","pN3","#NULL!"))]
+surv_dat[is.na(Grade),Grade := "#NULL!"]
+surv_dat[Grade == "4",Grade := "#NULL!"]
+surv_dat[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+surv_dat[,Grade := factor(Grade,levels = c("G3","G2","G1","#NULL!"))]
+surv_dat[,Mol_Signature := factor(Mol_Signature,levels = c("Luminal B (HER2-)","Luminal A","Luminal B (HER2+)","HER2","Triple negative","#NULL!"))]
+
+#Calculate coxph on model on primary tumor heterogeneity and clinical features
+res.cox2 <- coxph(Surv(surv_dat$OS, surv_dat$censoring) ~ shannon_prim + shannon_prim + Grade + Mol_Signature +pN_4gr, data =  surv_dat)
+summary(res.cox2)
+
+
+#Combine primary and LN met
+primary = primary[PID %in% met$PID,]
+met = met[PID %in% primary$PID,]
+
+#Order the same
+met = met[order(match(PID,primary$PID)),]
+
+#Calculate shannon entropies for primary and LN mets
+all_ents = as.data.table(met$PID)
+names(all_ents) = "PID"
+all_ents$shannon_prim = apply(as.matrix(primary[,-"PID"]),1,entropy.ChaoShen)
+all_ents$shannon_met = apply(as.matrix(met[,-"PID"]),1,entropy.ChaoShen)
+
+#Add molecular subtype info
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Mol_Signature")]))
+add = add[Mol_Signature != "#NULL!",]
+add[duplicated(PID),Mol_Signature := NA]
+add[duplicated(PID,fromLast = T),Mol_Signature := NA]
+add = unique(add)
+comb = merge(all_ents,add,all.x = T,by = "PID")
+
+#Paired comparison
+long = melt.data.table(as.data.table(comb),id.vars = c("PID","Mol_Signature"))
+ggpaired(long, x = "variable", y = "value")
+ggpaired(long, x = "variable", y = "value")+facet_wrap(.~Mol_Signature)
+
+#Split into cases where met/prim more heterogeneous
+all_ents$heterogeneous[all_ents$shannon_prim > all_ents$shannon_met] = "Prim"
+all_ents$heterogeneous[all_ents$shannon_prim < all_ents$shannon_met] = "Met"
+long = melt.data.table(as.data.table(all_ents),id.vars = c("PID","heterogeneous"))
+ggpaired(long, x = "variable", y = "value")+facet_wrap(.~heterogeneous)
+
+
+#Survival primary or met more heterogeneous
+surv_dat = unique(as.data.table(colData(sce_t)[,c('OS','Livestatus1censored',"PID")]))
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat = surv_dat[!is.na(censoring),]
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Grade","Mol_Signature","pN_4gr")]))
+add$Mol_Signature[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$Mol_Signature[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$Grade[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = T)] = "#NULL!"
+add$pN_4gr[duplicated(add$PID,fromLast = F)] = "#NULL!"
+add = unique(add)
+surv_dat = merge(surv_dat,add,by = "PID",all.x = T)
+surv_dat = merge(surv_dat,all_ents,by = "PID")
+
+#Calc curves
+SurvObj <- Surv(surv_dat$OS, surv_dat$censoring)
+km.as.groups <- survfit(SurvObj ~ surv_dat$heterogeneous)
+km.as.one <- survfit(SurvObj ~ 1)
+
+par(mfrow=c(1,2))
+for (i in unique(surv_dat$heterogeneous)){
+  cur = unique(surv_dat$heterogeneous)[unique(surv_dat$heterogeneous) == i]
+  cur_dat = subset(surv_dat, surv_dat$heterogeneous == cur)
+  if (nrow(cur_dat) > 1){
+  SurvObj_cur <- Surv(cur_dat$OS, cur_dat$censoring)
+  km.cur.group <- survfit(SurvObj_cur ~ 1)
+  plot(km.cur.group,mark.time = T,col = "red",xlim=range(1:500))
+  par(new=TRUE)
+  plot(km.as.one,mark.time = T,col = "black",xlim=range(1:500))
+  legend("bottomleft",1,cur,"red", cex=3)}
+}
+
+
+#Set refrerence levels and clean clinical classifications
+surv_dat[pN_4gr == "pN0",pN_4gr := "#NULL!"]#Only in mets
+surv_dat[is.na(pN_4gr),pN_4gr := "#NULL!"]
+surv_dat[pN_4gr == "7",pN_4gr := "#NULL!"]
+surv_dat[,pN_4gr := factor(pN_4gr,levels = c("pN1","pN2","pN3","#NULL!"))]
+surv_dat[is.na(Grade),Grade := "#NULL!"]
+surv_dat[Grade == "4",Grade := "#NULL!"]
+surv_dat[is.na(Mol_Signature),Mol_Signature := "#NULL!"]
+surv_dat[,Grade := factor(Grade,levels = c("G3","G2","G1","#NULL!"))]
+surv_dat[,Mol_Signature := factor(Mol_Signature,levels = c("Luminal B (HER2-)","Luminal A","Luminal B (HER2+)","HER2","Triple negative","#NULL!"))]
+
+#Coxph on met and primary heterogeneity and clinical classifications
+res.cox2 <- coxph(Surv(surv_dat$OS, surv_dat$censoring) ~ shannon_met + shannon_prim + Grade + Mol_Signature +pN_4gr, data =  surv_dat)
+summary(res.cox2)
+
+#Extract hazard ratios and confidence intervals from model output
+CI = confint(res.cox2)
+dt <- data.table(x = names(res.cox2$coefficients),
+                 HR = exp(res.cox2$coefficients),
+                 L = exp(CI[,1]),
+                 U = exp(CI[,2]))
+
+#Sort by increasing hazard ratio
+dt = dt[order(HR),]
+
+#Association is significant if the CI of the hazard ratio does not include 1
+dt$sign = "non significant"
+dt$sign[dt$L < 1 & dt$U < 1] = "significant"
+dt$sign[dt$L > 1 & dt$U > 1] = "significant"
+dt$x = factor(dt$x,levels = dt$x)
+
+#Visualize hazard ratios
+p = ggplot(dt, aes(x = x, y = HR, color = sign)) +
+geom_point(size = 4) +
+geom_errorbar(aes(ymax = U, ymin = L))+
+scale_color_manual(values = c('lightblue','red'))+
+coord_flip()+ylim(0,5)+
+geom_hline(yintercept = 1,color = 'blue')
+#scale_y_continuous(trans='log')
+
+p
+
+
+#Heterogeneity by patient group (for matched)
+grps = unique(as.data.table(colData(sce_t)[,c("PID","pgroups","mgroups")]))
+all_ents = merge(all_ents,grps,by = "PID")
+
+#Primary in pgroups
+ggplot(all_ents,aes(x = as.factor(pgroups),y = shannon_prim))+
+  geom_boxplot()
+
+#Met in pgroups
+ggplot(all_ents,aes(x = as.factor(pgroups),y = shannon_met))+
+  geom_boxplot()
+
+#Met in mgroups
+ggplot(all_ents,aes(x = as.factor(mgroups),y = shannon_met))+
+  geom_boxplot()
+
+#Primaries in mgroups
+ggplot(all_ents,aes(x = as.factor(mgroups),y = shannon_prim))+
+  geom_boxplot()
+
+```
+
+Kaplan-Meier survival curves for different patient groups
+```{r KM patient groups}
+#Get survival and clinical data
+surv_dat = unique(as.data.table(colData(sce_t)[,c('pgroups','TissueType','OS','Livestatus1censored',"Grade","PID","Mol_Signature","pN_4gr","age")]))
+surv_dat = surv_dat[TissueType == "primary tumor",]
+surv_dat = surv_dat[!is.na(pgroups),]
+surv_dat$pgroups = as.factor(surv_dat$pgroups)
+surv_dat = surv_dat[!is.na(OS),]
+surv_dat$censoring[surv_dat$Livestatus1censored == 1] = 0
+surv_dat$censoring[surv_dat$Livestatus1censored == 0] = 1
+surv_dat$Mol_Signature[duplicated(surv_dat$PID,fromLast = F)] = "#NULL!"
+surv_dat$Mol_Signature[duplicated(surv_dat$PID,fromLast = T)] = "#NULL!"
+surv_dat$Grade[duplicated(surv_dat$PID,fromLast = T)] = "#NULL!"
+surv_dat$Grade[duplicated(surv_dat$PID,fromLast = F)] = "#NULL!"
+surv_dat$pN_4gr[duplicated(surv_dat$PID,fromLast = T)] = "#NULL!"
+surv_dat$pN_4gr[duplicated(surv_dat$PID,fromLast = F)] = "#NULL!"
+surv_dat = unique(surv_dat)
+
+#Calc curves
+SurvObj <- Surv(surv_dat$OS, surv_dat$censoring)
+km.as.groups <- survfit(SurvObj ~ surv_dat$pgroups)
+km.as.one <- survfit(SurvObj ~ 1)
+
+#Plot the patient group survival curves next to each other
+par(mfrow=c(4,5))
+for (i in sort(unique(surv_dat$pgroups))){
+  cur = unique(surv_dat$pgroups)[unique(surv_dat$pgroups) == i]
+  cur_dat = subset(surv_dat, surv_dat$pgroups == cur)
+  if (nrow(cur_dat) > 1){
+  SurvObj_cur <- Surv(cur_dat$OS, cur_dat$censoring)
+  km.cur.group <- survfit(SurvObj_cur ~ 1)
+  plot(km.cur.group,mark.time = T,col = pcols$col[cur],xlim=range(1:500))
+  par(new=TRUE)
+  plot(km.as.one,mark.time = T,col = "black",xlim=range(1:500))
+  legend("bottomleft",1,cur,pcols$col[cur], cex=3)}
+}
+
+#Grade
+par(mfrow=c(4,5))
+cur = 0
+for (i in c("G1","G2","G3","4")){
+  cur = cur + 1
+  cur_dat = subset(surv_dat, surv_dat$Grade == i)
+  SurvObj_cur <- Surv(cur_dat$OS, cur_dat$censoring)
+  km.cur.group <- survfit(SurvObj_cur ~ 1)
+  plot(km.cur.group,mark.time = T,col = c('green','blue','red','black')[cur],xlim=range(1:500))
+  par(new=TRUE)
+  plot(km.as.one,mark.time = T,col = "black",xlim=range(1:500))
+  legend("bottomleft",1,cur,c('green','blue','red','black')[cur], cex=3)
+}
+
+#Nodal status
+surv_dat$pN_4gr = as.factor(surv_dat$pN_4gr)
+par(mfrow=c(4,5))
+for (i in levels(surv_dat$pN_4gr)){
+  cur_dat = subset(surv_dat, surv_dat$pN_4gr == i)
+  SurvObj_cur <- Surv(cur_dat$OS, cur_dat$censoring)
+  km.cur.group <- survfit(SurvObj_cur ~ 1)
+  plot(km.cur.group,mark.time = T,col = cols_pN_4gr[pN_4gr == i,]$col,xlim=range(1:500))
+  par(new=TRUE)
+  plot(km.as.one,mark.time = T,col = "black",xlim=range(1:500))
+  legend("bottomleft",1,i,cols_pN_4gr[pN_4gr == i,]$col, cex=3)
+}
+
+#Molecular subtype
+par(mfrow=c(4,5))
+cur = 0
+for (i in unique(surv_dat$Mol_Signature)){
+  cur = cur + 1
+  cur_dat = subset(surv_dat, surv_dat$Mol_Signature == i)
+  SurvObj_cur <- Surv(cur_dat$OSfinal, cur_dat$censoring)
+  km.cur.group <- survfit(SurvObj_cur ~ 1)
+  plot(km.cur.group,mark.time = T,col = cols_mol[Mol_Signature == i,]$col,xlim=range(1:320))
+  par(new=TRUE)
+  plot(km.as.one,mark.time = T,col = "black",xlim=range(1:320))
+  legend("bottomleft",1,i,cols_mol[Mol_Signature == i,]$col, cex=3)
+}
+dev.off()
+
+#Plot age class
+surv_dat$age_class <- "old"
+surv_dat[age < 50,age_class := "young"]
+
+par(mfrow=c(1,2))
+for (i in sort(unique(surv_dat$age_class))){
+  cur = unique(surv_dat$age_class)[unique(surv_dat$age_class) == i]
+  cur_dat = subset(surv_dat, surv_dat$age_class == cur)
+  if (nrow(cur_dat) > 1){
+  SurvObj_cur <- Surv(cur_dat$OS, cur_dat$censoring)
+  km.cur.group <- survfit(SurvObj_cur ~ 1)
+  plot(km.cur.group,mark.time = T,col = "red",xlim=range(1:500))
+  par(new=TRUE)
+  plot(km.as.one,mark.time = T,col = "black",xlim=range(1:500))
+  legend("bottomleft",1,cur,"red", cex=3)}
+}
+
+#Plot Kaplan-Meier curves
+SurvObj <- Surv(surv_dat$OS, surv_dat$censoring)
+km.as.groups <- survfit(SurvObj ~ surv_dat$age_class)
+
+ggplot(tidy(km.as.groups), aes(time, estimate, group = strata)) +
+    geom_line(aes(color = strata)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .25)+
+  ylim(0,1)+ggtitle("Primary tumors")
+
+```

@@ -1,0 +1,1542 @@
+---
+title: "Analysis_pipeline5_revision_prep"
+author: "Jana Fischer"
+date: "26 1 2021"
+output: html_document
+---
+
+Preparations for potential reviewer questions. Used R4.0 for this.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include = F}
+library(Rphenograph)
+library(igraph)
+library(scater)
+library(ComplexHeatmap)
+library(circlize)
+library(ggalluvial)
+library(patchwork)
+library(edgeR)
+library(diffcyt)
+library(data.table)
+```
+
+Cluster cells only based on ER, PR, HER2, Ki-67 (clinical markers) to see how much variation between primary and LN met there is then
+```{r, eval = F}
+#Read tumor single-cell data
+sce_t = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_T.rds')
+clin_channels = c("Gd156_Estrogen Receptor Alpha","Gd158_Progesterone Receptor A/B","Er168_Ki-67","Eu151_c-erbB-2 - Her2")
+
+#Cluster
+set.seed(3)
+rpheno_out = Rphenograph(t(counts(sce_t[clin_channels,])), k = 50)
+sce_t$clin_clustering = as.factor(igraph::membership(rpheno_out[[2]]))
+
+# #Save out
+# #Save tumor SCE with clinical PG info
+# saveRDS(sce_t, file = '/home/rstudio/mnt/ZTMA_21_25_26/analysis/SCE_T_clin_clustering.rds', ascii = FALSE)
+```
+
+Read in clustered data (saved out above) and plot heatmap
+```{r}
+#Read
+sce_t = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_T_clin_clustering.rds')
+
+#Heatmap of markers used for clustering (don't use KI67 for metaclustering)
+sum = sumCountsAcrossCells(sce_t[c("Gd156_Estrogen Receptor Alpha","Gd158_Progesterone Receptor A/B","Eu151_c-erbB-2 - Her2"),],average = T,colData(sce_t[c("Gd156_Estrogen Receptor Alpha","Gd158_Progesterone Receptor A/B","Eu151_c-erbB-2 - Her2"),])$clin_clustering, exprs_values = "counts")
+#p_dat = scale(t(assay(sum))) #R4.0
+p_dat = scale(t(sum))
+p_dat[p_dat > 3] =3
+p_dat[p_dat < -3] =-3
+
+#Plot heatmap and split into 12 metaclusters
+h_clusters_clin = Heatmap(p_dat, name = "clustered",column_title = "clustering markers", km = 1, col = colorRamp2(c(-2,0, 2), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",split = 12)
+h_clusters_clin
+
+#Extract metaclusters based on clustering of heatmap
+metaclusters = lapply(row_order(h_clusters_clin), function(x){rownames(p_dat)[x]})
+names(metaclusters) = 1:12
+n = sapply(1:12,function(x){rep(x,length(metaclusters[[x]]))})
+metaclusters = data.table(unlist(metaclusters))
+metaclusters$meta = unlist(n)
+names(metaclusters)[1] = 'clin_clustering'
+
+#Manually metacluster some more into 9 clusters and name clusters
+metaclusters[meta %in% c(2:3),meta := 2]
+metaclusters[meta %in% c(4),meta := 3]
+metaclusters[meta %in% c(5),meta := 4]
+metaclusters[meta %in% c(6),meta := 5]
+metaclusters[meta %in% c(7:8),meta := 6]
+metaclusters[meta %in% c(9),meta := 7]
+metaclusters[meta %in% c(10),meta := 8]
+metaclusters[meta %in% c(11:12),meta := 9]
+metaclusters[meta == 1, meta_name := "TNBC"]
+metaclusters[meta == 2, meta_name := "PR+ER-"]
+metaclusters[meta == 3, meta_name := "ERlowPR-"]
+metaclusters[meta == 4, meta_name := "Luminallow/TNBC"]
+metaclusters[meta == 5, meta_name := "HER2+HR-"]
+metaclusters[meta == 6, meta_name := "HER2hiHR-"]
+metaclusters[meta == 7, meta_name := "PRhiHER2lo"]
+metaclusters[meta == 8, meta_name := "HR+HER2lo/+"]
+metaclusters[meta == 9, meta_name := "ERhiHER2lo"]
+
+#Add new clustering to sce_t
+add = as.data.table(colData(sce_t)[,c("clin_clustering")])
+add$id = colnames(sce_t)
+names(add) = c("clin_clustering","id")
+add = merge(add,metaclusters[,-"meta"],by = "clin_clustering",all.x = T)
+add = add[order(match(id,colnames(sce_t))),]
+sce_t$clin_meta_name = add$meta_name
+
+#Heatmap of meta clusters
+sum = sumCountsAcrossCells(sce_t[c("Gd156_Estrogen Receptor Alpha","Gd158_Progesterone Receptor A/B","Eu151_c-erbB-2 - Her2"),],average = T,colData(sce_t[c("Gd156_Estrogen Receptor Alpha","Gd158_Progesterone Receptor A/B","Eu151_c-erbB-2 - Her2"),])$clin_meta_name, exprs_values = "counts")
+#p_dat = scale(t(assay(sum))) #R4.0
+p_dat = scale(t(sum))
+p_dat[p_dat > 3] =3
+p_dat[p_dat < -3] =-3
+
+#Plot
+h_clusters_clin_meta = Heatmap(p_dat, name = "clustered",column_title = "clustering markers", km = 1, col = colorRamp2(c(-2,0, 2), c('blue',"white", "red")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2")
+h_clusters_clin_meta
+meta_order = rownames(p_dat)[row_order(h_clusters_clin_meta)]
+```
+
+FlowDiagram primary LN met
+```{r}
+#On most abundant cluster in LN met
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','clin_meta_name','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+#Exclude shitty images and cells
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'clin_meta_name')]
+met[,test := .N,by = "PID"]
+#met = met[test >=100,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('clin_meta_name','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ clin_meta_name',value.var = 'frac_cluster',fill = 0)
+
+#Most abundant
+m = apply(met[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(met[,-"PID"])[x]})
+
+#Exclude ones with shared majority
+PID_excl = met$PID[unlist(lapply(n,length)) > 1]
+n = n[!unlist(lapply(n,length)) > 1]
+maj_met = as.data.table(unlist(n))
+names(maj_met) = "cluster_met"
+maj_met$PID = met$PID[!met$PID %in% PID_excl]
+
+#Most abundant cluster in primary tumor
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','clin_meta_name','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+#Exclude shitty images and cells
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'clin_meta_name')]
+primary[,test := .N,by = "PID"]
+#primary = primary[test >=100,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('clin_meta_name','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ clin_meta_name',value.var = 'frac_cluster',fill = 0)
+
+m = apply(primary[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(primary[,-"PID"])[x]})
+
+#Exclude ones with shared majority
+PID_excl = primary$PID[unlist(lapply(n,length)) > 1]
+n = n[!unlist(lapply(n,length)) > 1]
+maj_prim = as.data.table(unlist(n))
+names(maj_prim) = "cluster_prim"
+maj_prim$PID = primary$PID[!primary$PID %in% PID_excl]
+
+#Combine primary and LN met
+comb = merge(maj_prim,maj_met,by = "PID")
+comb[,Freq := .N ,by = c("cluster_prim","cluster_met")]
+comb = unique(comb[,c("cluster_prim","cluster_met","Freq")])
+comb$cluster_prim = factor(comb$cluster_prim,levels = meta_order)
+comb$cluster_met = factor(comb$cluster_met,levels = meta_order)
+clin_meta_cols = data.table(cluster = meta_order)
+clin_meta_cols$cols = colors()[c(499,502,551,55,115,77,37,419,8)]
+
+#Prepare color maps for ggalluvial
+prim_cols = clin_meta_cols[cluster %in% levels(comb$cluster_prim)[levels(comb$cluster_prim) %in% unique(comb$cluster_prim)],]
+met_cols = clin_meta_cols[cluster %in% levels(comb$cluster_met)[levels(comb$cluster_met) %in% unique(comb$cluster_met)],]
+prim_cols = rev(prim_cols[order(match(cluster,levels(comb$cluster_prim)[levels(comb$cluster_prim) %in% unique(comb$cluster_prim)])),]$cols)
+met_cols = rev(met_cols[order(match(cluster,levels(comb$cluster_met)[levels(comb$cluster_met) %in% unique(comb$cluster_met)])),]$cols)
+
+#Plot flowdiagram
+ggplot(comb,aes(y = Freq, axis1 = cluster_prim , axis3 = cluster_met)) +
+  geom_flow(stat = "alluvium", aes(fill = cluster_prim)) +
+  scale_x_discrete(limits = c("cluster_prim","cluster_met")) +
+  scale_fill_manual(values = rev(prim_cols))+
+  geom_stratum(fill = c(prim_cols,met_cols))+
+  geom_text(stat = "stratum", infer.label = TRUE)
+
+
+#How often does most abundant cluster match
+maj_prim = maj_prim[PID %in% maj_met$PID]
+maj_prim = maj_prim[order(match(PID,maj_met$PID))]
+maj_met = maj_met[PID %in% maj_prim$PID]
+maj_met = maj_met[order(match(PID,maj_prim$PID))]
+maj_prim$met_cluster = maj_met$cluster
+
+#Assign to group different or same
+maj_prim$grp[maj_prim$cluster == maj_prim$met_cluster] = "same"
+maj_prim$grp[is.na(maj_prim$grp)] = "different"
+
+p = maj_prim[,nPID := .N, by = c("grp")]
+p = unique(p[,c("grp","nPID")])
+g1 = ggplot(p,aes(x = as.factor(1),y = nPID, fill = grp))+geom_bar(stat = "identity")+scale_fill_grey()+
+  theme(aspect.ratio = 2)+
+  ggtitle("Majority cell type")
+
+
+#How often is the most abundant disseminated cluster present in the primary tumor
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','clin_meta_name','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+#Exclude shitty images and cells
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'clin_meta_name')]
+met[,test := .N,by = "PID"]
+#met = met[test >=100,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('clin_meta_name','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ clin_meta_name',value.var = 'frac_cluster',fill = 0)
+
+m = apply(met[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(met[,-"PID"])[x]})
+
+#Exclude ones with shared majority
+PID_excl = met$PID[unlist(lapply(n,length)) > 1]
+n = n[!unlist(lapply(n,length)) > 1]
+
+maj_met = as.data.table(unlist(n))
+names(maj_met) = "cluster"
+maj_met$PID = met$PID[!met$PID %in% PID_excl]
+
+#Primary
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','clin_meta_name','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+#Exclude shitty images and cells
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'clin_meta_name')]
+primary[,test := .N,by = "PID"]
+#primary = primary[test >=100,]
+primary[,frac := ncells/.N,by = "PID"]
+
+maj_met = maj_met[PID %in% primary$PID,]
+
+#Check how many in primary for each
+maj_met$fracPrim = NA
+for (i in 1:nrow(maj_met)){
+  curPID = maj_met$PID[i]
+  curClus = maj_met$cluster[i]
+  
+  unIDs = unique(primary[PID == curPID & clin_meta_name == curClus]$id)
+  maj_met$existsPrim[i] = length(unIDs)
+  if (length(unIDs) > 0){
+    maj_met$fracPrim[i] = unique(primary[PID == curPID & clin_meta_name == curClus]$frac)
+  }
+}
+
+#At least 5 cells
+maj_met$existsLog[maj_met$existsPrim < 5 ] = "absent"
+maj_met$existsLog[is.na(maj_met$existsLog)] = "present"
+
+p = maj_met[,nPID := .N, by = c("existsLog")]
+p = unique(p[,c("existsLog","nPID")])
+g2 = ggplot(p,aes(x = as.factor(1),y = nPID, fill = existsLog))+geom_bar(stat = "identity")+scale_fill_grey()+
+  theme(aspect.ratio = 2)+
+  ggtitle("At least 5 cells")
+
+#plot next to each other
+g1 + g2
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/clin_clust.pdf")
+g1 + g2
+dev.off()
+
+```
+
+
+Paired differential abundance analysis of simplified tumor clusters between matched primary and LN met samples
+```{r differential abundance}
+#Extract relevant information for primary tumor and LN met samples
+both = as.data.table(data.frame(colData(subset(sce_t,,TissueType %in% c("primary tumor","lymph node mts")))[c('TissueType','PID','core','clin_meta_name','sizeflag')],id = colnames(subset(sce_t,,TissueType %in% c("primary tumor","lymph node mts")))))
+
+#Exclude sizeflagged cells
+both = both[sizeflag != 1,]
+
+#Only use samples with matched primary and LN met tissue
+both[,test:= length(unique(TissueType)),by = "PID"]
+both = both[test == 2,]
+
+#Calculate number of cells from each cluster in primary and LN met sample of each patient
+both[,ncells:=.N ,by= c('PID','TissueType', 'clin_meta_name')]
+both = unique(both[,c('clin_meta_name','ncells','PID','TissueType')])
+
+#Prepare data for differential abundance analysis using edgeR
+both = dcast.data.table(both, 'PID + TissueType ~ clin_meta_name',value.var = 'ncells',fill = 0)
+both$TissueType = factor(both$TissueType,levels =c("primary tumor","lymph node mts"))
+both$PID = factor(both$PID)
+
+#Create design matrix
+design <- createDesignMatrix(
+  both[,c("PID","TissueType")], cols_design = c( "PID","TissueType")
+)
+
+#Create contrast
+contrast <- createContrast(c(rep(0, ncol(design)-1),1))
+
+#Check contrast
+data.frame(parameters = colnames(design), contrast)
+
+#Normalize
+norm_factors <- calcNormFactors(t(both[,-c("PID","TissueType")]), method = "TMM")
+
+#Differential abundance
+y <- DGEList(t(both[,-c("PID","TissueType")]), norm.factors = norm_factors)
+y <- estimateDisp(y,design)
+
+fit <- glmFit(y, design)
+lrt <- glmLRT(fit, contrast = contrast)
+top <- edgeR::topTags(lrt, n = Inf, adjust.method = "BH", 
+        sort.by = "none")
+
+#Write out result table
+res = as.data.table(top$table)
+res$cluster = rownames(top$table)
+res$sign = 0
+res$sign[res$FDR < 0.01] = 1
+res[order(FDR)]
+
+#Plot logFC of significant clusters
+res = res[sign == 1,]
+res[logFC > 0,posneg := "pos"]
+res[logFC < 0,posneg := "neg"]
+res = res[order(logFC)]
+res[,cluster := factor(cluster,levels = cluster)]
+
+ggplot(res,aes(y = cluster, x = logFC, fill = posneg))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = c("lightblue","purple"))
+
+ggplot(res,aes(y = cluster, x = logFC, fill = cluster))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = clin_meta_cols[order(match(cluster,res$cluster))]$cols)
+
+```
+
+EMdist between primary tumor and matched LN met for all markers
+```{r}
+library(emdist)
+
+#Get marker single-cell counts and relevant metadata for matched samples
+dat = data.table(id = colnames(subset(sce_t,,sizeflag != 1)),t(counts(subset(sce_t,,sizeflag != 1))),PID = subset(sce_t,,sizeflag != 1)$PID, TissueType = subset(sce_t,,sizeflag != 1)$TissueType)
+dat = dat[TissueType %in% c("primary tumor","lymph node mts"),]
+dat[,ntissues := length(unique(TissueType)), by = c("PID")]
+dat = dat[ntissues == 2,]
+#Kick out images with few cells
+dat[,ncells := .N,by = "PID"]
+dat = dat[ncells>=100,]
+dat$ncells = NULL
+
+# #PR
+# ggplot(cur, aes(`Gd158_Progesterone Receptor A/B`, fill=TissueType)) + geom_density(alpha=0.5)
+
+#Prepare data.frame to save output into
+pids = data.frame(PID = unique(dat$PID))
+m = as.data.frame(matrix(0,nrow(pids),length(colnames(dat)[!colnames(dat) %in% c("TissueType","ntissues","id","PID")])))
+colnames(m) = colnames(dat)[!colnames(dat) %in% c("TissueType","ntissues","id","PID")]
+emds = cbind(pids,m)
+
+#Loop through all patients
+for (i in 1:length(unique(dat$PID))){
+  cur = dat[PID == unique(dat$PID)[i]]
+  
+  #Loop through all markers
+  for (marker in colnames(cur)[!colnames(cur) %in% c("PID","TissueType","ntissues","id")]){
+    
+      #Calculate emd between primary and met for current marker
+      c = density(as.matrix(cur[TissueType == "primary tumor",eval(marker),with = F]))
+      c_mat = as.matrix(data.frame(x = c$y,y = c$x))
+      
+      d = density(as.matrix(cur[TissueType == "lymph node mts",eval(marker),with = F]))
+      d_mat = as.matrix(data.frame(x = d$y,y = d$x))
+      
+      emds[i,marker] = emd(c_mat,d_mat)
+  }
+}
+
+emds = as.data.table(emds)
+fwrite(emds,"/mnt/ZTMA_21_25_26/analysis/emds_primary_met.csv",col.names = T)
+
+emd_long = melt.data.table(emds,id.vars = "PID",value.name = "emds",variable.name = "channel")
+
+
+ggplot(emd_long,aes(x = channel,y =emds))+geom_boxplot()+theme(axis.text.x = element_text(angle = 90))
+
+
+#Compare HH3 between any 2 primary tumors or LN mets
+set.seed(2)
+emds_prim = rep(0,length(unique(dat$PID)))
+
+#Loop through all patients so it results in same amount of comparisons as above
+for (i in 1:length(unique(dat$PID))){
+  rand = sample(unique(dat$PID),2, replace = F)
+  cur = dat[PID %in% rand,]
+    
+  #Calculate emd between 2 different primaries for HH3
+  c = density(as.matrix(cur[PID == rand[1],"In113_Histone H3",with = F]))
+  c_mat = as.matrix(data.frame(x = c$y,y = c$x))
+  
+  d = density(as.matrix(cur[PID == rand[2],"In113_Histone H3",with = F]))
+  d_mat = as.matrix(data.frame(x = d$y,y = d$x))
+  
+  emds_prim[i] = emd(c_mat,d_mat)
+
+}
+
+
+emds = fread("/mnt/ZTMA_21_25_26/analysis/emds_primary_met.csv",header = T)
+comb = emds[,c("PID","In113_Histone H3")]
+comb$type = "prim_met"
+
+prim = data.table(PID = 1000,`In113_Histone H3` = emds_prim,type = "prim_prim")
+comb = rbind(comb,prim)
+
+ggplot(comb,aes(x =type ,y =`In113_Histone H3`))+geom_boxplot()+theme(axis.text.x = element_text(angle = 90))
+
+```
+
+Dot plot fractions in primary vs met but with clin_meta_name
+```{r}
+#Met
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','clin_meta_name','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'clin_meta_name')]
+met[,test := .N,by = "PID"]
+met = met[test >=100,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('clin_meta_name','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ clin_meta_name',value.var = 'frac_cluster',fill = 0)
+
+#Primary
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','clin_meta_name','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'clin_meta_name')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=100,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('clin_meta_name','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ clin_meta_name',value.var = 'frac_cluster',fill = 0)
+
+met = met[PID %in% primary$PID,]
+primary = primary[PID %in% met$PID,]
+met = met[order(match(PID, primary$PID)),]
+
+
+met = melt.data.table(met,id.vars = "PID")
+primary = melt.data.table(primary,id.vars = "PID")
+
+comb = merge(met,primary,by = c("PID","variable"))
+colnames(comb) = c("PID","cluster","frac_met","frac_primary")
+
+#Exclude ones that are not present in primary or met
+comb = comb[!(frac_met == 0 & frac_primary == 0),]
+
+ggplot(comb,aes(x = frac_met, y = frac_primary,color = cluster))+
+  geom_point()+
+  scale_color_manual(values = clin_meta_cols[order(match(cluster,levels(comb$cluster))),]$col)
+
+#Correlation
+cor(comb$frac_met,comb$frac_primary)
+
+```
+
+Same analysis but across cores from the same primary tumor in Zurich dataset
+```{r}
+#Read data from previous analysis
+Zurich_dat = fread("/mnt/ZTMA_21_25_26/analysis/ZurichTMA_clusters.csv",header = T)
+Zurich_dat = Zurich_dat[!location == "[]"]
+
+#Only tumor cells
+Zurich_dat = Zurich_dat[cluster %in% c(14:27),]
+
+#Calculate fractions per core
+Zurich_dat[,ncells := .N,by = c("cluster","core")]
+Zurich_dat[,frac := ncells/.N, by = "core"]
+Zurich_dat = unique(Zurich_dat[,-c("id","ncells")])
+
+#Select 2 from each patient
+Zurich_dat[,ncores := length(unique(core)),by = "PID"]
+Zurich_dat = Zurich_dat[ncores > 1,]
+sample = lapply(unique(Zurich_dat$PID),function(x){sample(unique(Zurich_dat[PID == x,]$core),2,replace = F)})
+Zurich_dat = Zurich_dat[core %in% unlist(sample),]
+Zurich_dat[,ncores := length(unique(core)),by = "PID"] #check
+
+#Select one to be analogous to primary and other to met
+sample = lapply(unique(Zurich_dat$PID),function(x){sample(unique(Zurich_dat[PID == x,]$core),1,replace = F)})
+one = Zurich_dat[core %in% sample,]
+other = Zurich_dat[!core %in% sample,]
+setnames(one, "frac", "frac_one")
+setnames(other, "frac", "frac_other")
+
+comb = merge(one[,c("core","PID","frac_one","cluster")],other[,c("core","PID","frac_other","cluster")],by = c("PID","cluster"))
+comb$cluster = as.factor(comb$cluster)
+
+#Metacluster colors from previous paper
+mycols_basel_meta <- colors()[c(258,257,86,85,259,81, #green
+                                652, #yellow
+                                636,520,430,109,68,43,#light blue
+                                132,#other dark blue
+                                26,#dark blue
+                                8,12, #turquouis
+                                33,#red
+                                551,#dark purple
+                                95,#light purple
+                                419,#light pink
+                                117,#pink
+                                52,#burnt orange
+                                500,#orange
+                                568,#pink orange
+                                624, #brown
+                                133)] #dark red
+
+#Exclude ones that are not present in primary or met
+comb = comb[!(frac_one == 0 & frac_other == 0),]
+
+ggplot(comb,aes(x = frac_one, y = frac_other,color = cluster))+
+  geom_point()+
+  scale_color_manual(values = mycols_basel_meta[14:27])
+
+#Correlation
+cor(comb$frac_one,comb$frac_other)
+```
+
+KL divergence across cores from the same primary tumor in Zurich dataset
+```{r}
+library(entropy)
+
+#Read data from previous analysis
+Zurich_dat = fread("/mnt/ZTMA_21_25_26/analysis/ZurichTMA_clusters.csv",header = T)
+Zurich_dat = Zurich_dat[!location == "[]"]
+
+#Only tumor cells
+Zurich_dat = Zurich_dat[cluster %in% c(14:27),]
+
+#Calculate fractions per core
+Zurich_dat[,ncells := .N,by = c("cluster","core")]
+Zurich_dat[,frac := ncells/.N, by = "core"]
+Zurich_dat = unique(Zurich_dat[,-c("id","ncells")])
+
+#Fill in missing ones with almost 0 (Dividing by zero in KL divergence results in inf)
+Zurich_dat =dcast.data.table(Zurich_dat,"core + PID + location ~ cluster",value.var = "frac",fill = 0.000001)
+Zurich_dat = melt.data.table(Zurich_dat,id.vars = c("core","PID","location"),variable.name = "cluster",value.name = "frac")
+
+#Select 2 from each patient
+Zurich_dat[,ncores := length(unique(core)),by = "PID"]
+Zurich_dat = Zurich_dat[ncores > 1,]
+sample = lapply(unique(Zurich_dat$PID),function(x){sample(unique(Zurich_dat[PID == x,]$core),2,replace = F)})
+Zurich_dat = Zurich_dat[core %in% unlist(sample),]
+Zurich_dat[,ncores := length(unique(core)),by = "PID"] #check
+
+#Select one to be analogous to primary and other to met
+sample = lapply(unique(Zurich_dat$PID),function(x){sample(unique(Zurich_dat[PID == x,]$core),1,replace = F)})
+one = Zurich_dat[core %in% sample,]
+other = Zurich_dat[!core %in% sample,]
+setnames(one, "frac", "frac_one")
+setnames(other, "frac", "frac_other")
+
+KL_zurich = merge(one[,c("core","PID","frac_one","cluster")],other[,c("core","PID","frac_other","cluster")],by = c("PID","cluster"))
+KL_zurich$cluster = as.factor(KL_zurich$cluster)
+
+#KL divergence
+KL_zurich[,KLdiv := KL.plugin(frac_one,frac_other),by = "PID"]
+
+```
+
+KL divergence between primary and met on clinical clustering
+```{r}
+#Met
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','clin_meta_name','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'clin_meta_name')]
+met[,test := .N,by = "PID"]
+met = met[test >=100,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('clin_meta_name','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ clin_meta_name',value.var = 'frac_cluster',fill = 0)
+
+#Primary
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','clin_meta_name','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'clin_meta_name')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=100,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('clin_meta_name','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ clin_meta_name',value.var = 'frac_cluster',fill = 0)
+
+met = met[PID %in% primary$PID,]
+primary = primary[PID %in% met$PID,]
+met = met[order(match(PID, primary$PID)),]
+
+
+met = melt.data.table(met,id.vars = "PID")
+primary = melt.data.table(primary,id.vars = "PID")
+
+KL_clin = merge(met,primary,by = c("PID","variable"))
+colnames(KL_clin) = c("PID","cluster","frac_met","frac_primary")
+
+#Add small number to zeros so KL divergence doesn't become inf
+KL_clin[frac_met == 0,frac_met := 0.000001]
+KL_clin[frac_primary == 0,frac_primary := 0.000001]
+
+#KL divergence
+KL_clin[,KLdiv := KL.plugin(frac_primary,frac_met),by = "PID"]
+
+```
+
+KL div on 59 tumor clusters
+```{r}
+#Read in tumor sce
+sce_t_orig = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_T.rds')
+
+
+#Met
+met = as.data.table(data.frame(colData(subset(sce_t_orig,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t_orig,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=100,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Primary
+primary = as.data.table(data.frame(colData(subset(sce_t_orig,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t_orig,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=100,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('tumor_cluster_100','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+met = met[PID %in% primary$PID,]
+primary = primary[PID %in% met$PID,]
+met = met[order(match(PID, primary$PID)),]
+
+
+met = melt.data.table(met,id.vars = "PID")
+primary = melt.data.table(primary,id.vars = "PID")
+
+KL_59 = merge(met,primary,by = c("PID","variable"))
+colnames(KL_59) = c("PID","cluster","frac_met","frac_primary")
+
+#Add small number to zeros so KL divergence doesn't become inf
+KL_59[frac_met == 0,frac_met := 0.000001]
+KL_59[frac_primary == 0,frac_primary := 0.000001]
+
+#KL divergence
+KL_59[,KLdiv := KL.plugin(frac_primary,frac_met),by = "PID"]
+
+
+```
+
+Compare KL divs as boxplots
+```{r}
+KL_clin$type = "clinical clustering prim-met"
+KL_zurich$type = "Zurich"
+KL_59$type = "59 clusters"
+
+comb = rbind(unique(KL_zurich[,c("PID","KLdiv","type")]),unique(KL_clin[,c("PID","KLdiv","type")]),unique(KL_59[,c("PID","KLdiv","type")]))
+
+ggplot(comb, aes(x = type,y = KLdiv))+ geom_boxplot()
+
+```
+
+Compare tumor cells without panCK with stromal cells
+```{r}
+sce_t = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_T.rds')
+sce_s = readRDS('/mnt/ZTMA_21_25_26/analysis/SCE_S.rds')
+tcols = fread('/mnt/ZTMA_21_25_26/analysis/tcols.csv',header = T)
+
+#Tumor colors
+t = data.table(id = colnames(sce_t),panCK = t(counts(sce_t["Lu175_Keratin Epithelial",])),type = sce_t$tumor_cluster_100)
+s = data.table(id = colnames(sce_s),panCK = t(counts(sce_s["Lu175_Keratin Epithelial",])),type = "stroma")
+comb = rbind(t,s)
+
+ggplot(comb,aes(x = `panCK.Lu175_Keratin Epithelial`,color = type))+geom_density() + scale_color_manual(values = c(tcols$tumor_cols,"black"))#,y=..scaled..
+
+#Only 58 vs stroma
+comb = comb[type %in% c("stroma","58"),]
+comb$type = factor(comb$type,levels = c("stroma","58"))
+ggplot(comb,aes(x = `panCK.Lu175_Keratin Epithelial`,fill = type,alpha = 0.5))+geom_density() + scale_fill_manual(values = c("black",tcols[cluster == 58,]$tumor_cols))
+
+#All tumor vs all stroma
+t = data.table(id = colnames(sce_t),panCK = t(counts(sce_t["Lu175_Keratin Epithelial",])),type = "tumor")
+s = data.table(id = colnames(sce_s),panCK = t(counts(sce_s["Lu175_Keratin Epithelial",])),type = "stroma")
+comb = rbind(t,s)
+
+#comb = comb[type == "tumor",]
+ggplot(comb,aes(x = `panCK.Lu175_Keratin Epithelial`,fill = type,alpha = 0.5))+geom_density()#+ylim(0,50)
+  
+
+```
+
+Find patients for which we need whole sections
+```{r}
+#Get most abundant LN met cluster
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=20,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Extract for each sample the cluster that makes up the largest proportion of cells
+m = apply(met[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(met[,-"PID"])[x]})
+
+#Exclude samples with shared largest proportion
+PID_excl = met$PID[unlist(lapply(n,length)) > 1]
+n = n[!unlist(lapply(n,length)) > 1]
+
+#Put most abundant LN met cluster for each patient into a table
+maj_met = as.data.table(unlist(n))
+names(maj_met) = "cluster_met"
+maj_met$PID = met$PID[!met$PID %in% PID_excl]
+
+
+#Get most abundant primary tumor cluster
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=20,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('tumor_cluster_100','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Extract for each sample the cluster that makes up the largest proportion of cells
+m = apply(primary[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(primary[,-"PID"])[x]})
+
+#Exclude samples with shared largest proportion
+PID_excl = primary$PID[unlist(lapply(n,length)) > 1]
+n = n[!unlist(lapply(n,length)) > 1]
+
+#Put most abundant primary tumor cluster for each patient into a table
+maj_prim = as.data.table(unlist(n))
+names(maj_prim) = "cluster_prim"
+maj_prim$PID = primary$PID[!primary$PID %in% PID_excl]
+
+
+#Combine primary and LN met 
+comb = merge(maj_prim,maj_met,by = "PID")
+
+#add clinical classification
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Mol_Signature","core","ER_pr")]))
+add[duplicated(PID),Mol_Signature := "#NULL!"]
+add[duplicated(PID,fromLast = T),Mol_Signature := "#NULL!"]
+add = unique(add)
+comb = merge(comb,add,by = "PID",all.x = T)
+setnames(comb,"core","core_primary")
+
+#add met cores
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "lymph node mts"))[,c("PID","core")]))
+comb = merge(comb,add,by = "PID",all.x = T)
+setnames(comb,"core","core_met")
+
+comb[cluster_met == "27",]
+comb[cluster_met == "7",]
+comb[cluster_met == "29",]
+
+#selection
+PIDs_selected_27 = c("569","713","126","761")
+PIDs_selected_7 = c("99","402","488","969")
+PIDs_selected_29 = c("171","1364")
+
+all = c(PIDs_selected_27,PIDs_selected_7,PIDs_selected_29)
+
+```
+
+Find node-negative primary tumors with dendritic cells (correlation is slightly better with numbers of cells instead of fractions -> maybe use density)
+```{r}
+#node neg primary tumors with cluster 29
+d = as.data.table(colData(subset(sce_t,,TissueType == "primary tumor" & pN_4gr == "pN0" & sizeflag != 1))[,c("PID","tumor_cluster_100")])
+d[,test := .N,by = "PID"]
+d = d[test >= 100,]
+d[,ncells := .N ,by = c("PID","tumor_cluster_100")]
+d[,frac_29 := ncells/.N,by = "PID"]
+d = unique(d[tumor_cluster_100 == "29",])
+
+#node neg primary tumors stromal clusters
+s = as.data.table(colData(subset(sce_s,,TissueType == "primary tumor" & pN_4gr == "pN0" & sizeflag != 1))[,c("PID","stroma_cluster")])
+s[,test := .N,by = "PID"]
+s = s[test >= 100,]
+s[,ncells := .N ,by = c("PID","stroma_cluster")]
+s[,frac := ncells/.N,by = "PID"]
+s = unique(s)
+s = dcast.data.table(s,"PID ~ stroma_cluster",value.var = "frac",fill = 0)
+
+d = merge(s,d[,c("PID","frac_29")],by = "PID",all.x = T)
+d[is.na(frac_29),frac_29:=0]
+
+c = cor(as.matrix(d[,-"PID"]))
+
+tcols = fread('/mnt/ZTMA_21_25_26/analysis/tcols.csv',header = T)
+scols = fread('/mnt/ZTMA_21_25_26/analysis/scols.csv',header = T)
+setnames(scols,"stroma_cols","cols")
+setnames(tcols,"tumor_cols","cols")
+tcols[,cluster := as.character(cluster)]
+tcols[cluster == 29,cluster := "frac_29"]
+cols = rbind(scols,tcols[cluster == "frac_29",])
+
+#clustered heatmap
+ha = HeatmapAnnotation(tumor = colnames(c),
+    col = list(tumor = structure(cols$cols,names = cols$cluster)))
+hm = Heatmap(c, name = "correlation",column_title = "stroma primary", km = 1, col = colorRamp2(c(-1,0, 1), c('mediumpurple3',"white", "darkorange")),
+            show_row_names = T, show_column_names =  T, clustering_method_rows = "ward.D2",clustering_method_columns = "ward.D2",top_annotation = ha)+
+  rowAnnotation(rn = anno_text(rownames(c)))
+
+cor(d$frac_29,s$`8`)
+
+ggplot(d,aes(x = frac_29,y = `8`))+geom_point()
+
+cores = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","core")]))
+d = merge(d,cores,by = "PID")
+d[frac_29 > 0.05 & `8` > 0.05]
+d[frac_29 > 100 & `8`> 50] #when using numbers of cells instead of fractions
+
+#Get whole slides for dendritic cells
+sel_neg = c("256","668","1771","1545","1415")
+
+
+#Are there generally more dendritic cells in primary tumors?
+s = as.data.table(colData(subset(sce_s,,TissueType == "primary tumor" & sizeflag != 1))[,c("PID","stroma_cluster","pN_4gr")])
+s[,test := .N,by = "PID"]
+s = s[test >= 100,]
+s[,ncells := .N ,by = c("PID","stroma_cluster")]
+s[,frac := ncells/.N,by = "PID"]
+s = unique(s[stroma_cluster == "8",])
+
+ggplot(s,aes(x = pN_4gr, y = frac))+geom_boxplot()
+
+
+#Check for node-positive tumors with cluster 29
+d = as.data.table(colData(subset(sce_t,,TissueType == "primary tumor" & pN_4gr %in% c("pN1","pN2","pN3") & sizeflag != 1))[,c("PID","tumor_cluster_100")])
+d[,test := .N,by = "PID"]
+d = d[test >= 100,]
+d[,ncells := .N ,by = c("PID","tumor_cluster_100")]
+d[,frac_29 := ncells/.N,by = "PID"]
+d = unique(d[tumor_cluster_100 == "29",])
+
+
+s = as.data.table(colData(subset(sce_s,,TissueType == "primary tumor" & pN_4gr %in% c("pN1","pN2","pN3") & sizeflag != 1))[,c("PID","stroma_cluster")])
+s[,test := .N,by = "PID"]
+s = s[test >= 100,]
+s[,ncells := .N ,by = c("PID","stroma_cluster")]
+s[,frac := ncells/.N,by = "PID"]
+s = unique(s)
+s = dcast.data.table(s,"PID ~ stroma_cluster",value.var = "frac",fill = 0)
+s = s[,c("PID","8")]
+
+d = merge(s,d,by = "PID",all.x = T)
+d[is.na(frac_29),frac_29 := 0]
+
+cor(d$frac_29,d$`8`)
+
+ggplot(d,aes(x = frac_29,y = `8`))+geom_point()
+
+d = merge(d,cores,by = "PID")
+d[frac_29 > 0.2 & `8` < 0.1]
+
+sel = c("234","420","424","1433","1632")
+
+#Or should I only use tumors where this cell type has acctually disseminated?
+m = as.data.table(colData(subset(sce_t,,TissueType == "lymph node mts" & sizeflag != 1))[,c("PID","tumor_cluster_100")])
+m[,test := .N,by = "PID"]
+m = m[test >= 100,]
+m[,ncells := .N ,by = c("PID","tumor_cluster_100")]
+m[,frac_29 := ncells/.N,by = "PID"]
+m = unique(m[tumor_cluster_100 == "29",])
+m = m[ncells > 5,]
+m[PID %in% sel,]
+
+
+d = d[PID %in% m$PID,]
+ggplot(d,aes(x = frac_29,y = `8`))+geom_point()
+d[frac_29 > 0.2 & `8` < 0.05]
+
+all = c(all,sel_neg,sel)
+all = as.numeric(all)
+sort(all)
+
+#Check that TMAs are right
+f = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","core")]))
+f = f[PID %in% all,]
+f[order(as.numeric(as.character(PID))),]
+
+```
+
+#Is clinical classification phenotype always present (at least) as subpopulation in the primary
+```{r}
+#Primary
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','sizeflag','Mol_Signature')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = cbind(primary, as.data.frame(t(counts(subset(sce_t,,TissueType == "primary tumor")))))
+primary = primary[sizeflag != 1,]
+
+ggplot(primary, aes(x = `Gd156_Estrogen Receptor Alpha`))+geom_density()
+
+res <- densityMclust(primary$`Gd156_Estrogen Receptor Alpha`, 2)
+primary$GMM_ER = res$classification
+res <- densityMclust(primary$`Gd158_Progesterone Receptor A/B`, 2)
+primary$GMM_PR = res$classification
+res <- densityMclust(primary$`Eu151_c-erbB-2 - Her2`, 2)
+primary$GMM_HER2 = res$classification
+primary[`Eu151_c-erbB-2 - Her2`<0.5,GMM_HER2 :=1]
+
+ggplot(primary, aes(x = `Eu151_c-erbB-2 - Her2`,fill = as.factor(GMM_HER2)))+geom_density()
+
+primary[,test := .N,by = "PID"]
+primary = primary[test >=20,]
+primary[,ncells :=sum(GMM_ER == 2) ,by= 'PID']
+primary[,frac_pos_ER := ncells/.N, by=c('PID')]
+
+primary[,ncells :=sum(GMM_PR == 2) ,by= 'PID']
+primary[,frac_pos_PR := ncells/.N, by=c('PID')]
+
+primary[,ncells :=sum(GMM_HER2 == 2) ,by= 'PID']
+primary[,frac_pos_HER2 := ncells/.N, by=c('PID')]
+
+primary = unique(primary[,c("PID","frac_pos_ER","frac_pos_PR","frac_pos_HER2",'Mol_Signature')])
+primary$HRpos_prim = 0
+primary$HER2pos_prim = 0
+primary[frac_pos_ER > 0.05 | frac_pos_PR > 0.05, HRpos_prim := 1]#It would actually be 0.05 but only claiming they are present not in at least 5%
+primary[frac_pos_HER2 > 0.1 , HER2pos_prim := 1]
+primary[HRpos_prim == 1 & HER2pos_prim == 1,ASCO := "HR+HER2+"]
+primary[HRpos_prim == 1 & HER2pos_prim == 0,ASCO := "HR+HER2-"]
+primary[HRpos_prim == 0 & HER2pos_prim == 1,ASCO := "HR-HER2+"]
+primary[HRpos_prim == 0 & HER2pos_prim == 0,ASCO := "HR-HER2-"]
+
+test = primary[Mol_Signature == "Luminal B (HER2-)",]
+
+p = test[,nHER2 := .N, by = c("HRpos_prim")]
+p = unique(p[,c("HRpos_prim","nHER2")])
+g1 = ggplot(p,aes(x = as.factor(1),y = nHER2, fill = as.factor(HRpos_prim)))+geom_bar(stat = "identity")+scale_fill_grey()+
+  theme(aspect.ratio = 2)+
+  ggtitle("Luminal B (HER2-)")
+
+test = primary[Mol_Signature == "Luminal A",]
+
+p = test[,nHER2 := .N, by = c("HRpos_prim")]
+p = unique(p[,c("HRpos_prim","nHER2")])
+g2 = ggplot(p,aes(x = as.factor(1),y = nHER2, fill = as.factor(HRpos_prim)))+geom_bar(stat = "identity")+scale_fill_grey()+
+  theme(aspect.ratio = 2)+
+  ggtitle("Luminal A")
+
+test = primary[Mol_Signature == "Luminal B (HER2+)",]
+
+p = test[,nHER2 := .N, by = c("HER2pos_prim")]
+p = unique(p[,c("HER2pos_prim","nHER2")])
+g3 = ggplot(p,aes(x = as.factor(1),y = nHER2, fill = as.factor(HER2pos_prim)))+geom_bar(stat = "identity")+scale_fill_grey()+
+  theme(aspect.ratio = 2)+
+  ggtitle("Luminal B (HER2+)")
+
+test = primary[Mol_Signature == "Triple negative",]
+
+g1 + g2 + g3
+
+
+
+#Flowdiagram (mol_sign -> primary ASCO/CAP -> LN met)
+primary[,freq := .N, by = c("Mol_Signature","ASCO")]
+primary[,Mol_Signature:= factor(Mol_Signature,levels = c("Luminal B (HER2-)","Luminal B (HER2+)","#NULL!","Triple negative","Luminal A","HER2"))]
+test = unique(primary[,c("Mol_Signature","ASCO","freq")])
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/flow.pdf")
+ggplot(test,aes(y = freq, axis1 = Mol_Signature , axis3 = ASCO)) +
+  geom_flow(stat = "alluvium", aes(fill = Mol_Signature)) +
+  scale_x_discrete(limits = c("Mol_Signature","ASCO")) +
+  scale_fill_manual(values = cols_mol$col)+
+  geom_stratum(fill = c(rev(cols_mol$col[1:6]),c("grey20","grey70","grey50","grey90")))+
+  geom_text(stat = "stratum", infer.label = TRUE)
+dev.off()
+
+
+#Add primary and LN met
+
+all = as.data.table(data.frame(colData(subset(sce_t,,TissueType %in% c("primary tumor","lymph node mts")))[c('PID','sizeflag','Mol_Signature',"TissueType")],id = colnames(subset(sce_t,,TissueType %in% c("primary tumor","lymph node mts")))))
+all = cbind(all, as.data.frame(t(counts(subset(sce_t,,TissueType %in% c("primary tumor","lymph node mts"))))))
+all = all[sizeflag != 1,]
+
+ggplot(all, aes(x = `Gd156_Estrogen Receptor Alpha`))+geom_density()
+
+res <- densityMclust(all$`Gd156_Estrogen Receptor Alpha`, 2)
+all$GMM_ER = res$classification
+res <- densityMclust(all$`Gd158_Progesterone Receptor A/B`, 2)
+all$GMM_PR = res$classification
+res <- densityMclust(all$`Eu151_c-erbB-2 - Her2`, 2)
+all$GMM_HER2 = res$classification
+all[`Eu151_c-erbB-2 - Her2`<0.5,GMM_HER2 :=1]
+
+ggplot(all, aes(x = `Eu151_c-erbB-2 - Her2`,fill = as.factor(GMM_HER2)))+geom_density()
+
+
+all[,test := .N,by = c("PID","TissueType")]
+all = all[test >=20,]
+all[,ncells :=sum(GMM_ER == 2) ,by= c("PID","TissueType")]
+all[,frac_pos_ER := ncells/.N, by=c("PID","TissueType")]
+
+all[,ncells :=sum(GMM_PR == 2) ,by= c("PID","TissueType")]
+all[,frac_pos_PR := ncells/.N, by=c("PID","TissueType")]
+
+all[,ncells :=sum(GMM_HER2 == 2) ,by= c("PID","TissueType")]
+all[,frac_pos_HER2 := ncells/.N, by=c("PID","TissueType")]
+
+all = unique(all[,c("PID","frac_pos_ER","frac_pos_PR","frac_pos_HER2",'Mol_Signature',"TissueType")])
+all$HRpos_prim = 0
+all$HER2pos_prim = 0
+all[frac_pos_ER > 0.05 | frac_pos_PR > 0.05, HRpos_prim := 1]#It would actually be 0.05 but only claiming they are present not in at least 5%
+all[frac_pos_HER2 > 0.1 , HER2pos_prim := 1]
+all[HRpos_prim == 1 & HER2pos_prim == 1,ASCO := "HR+HER2+"]
+all[HRpos_prim == 1 & HER2pos_prim == 0,ASCO := "HR+HER2-"]
+all[HRpos_prim == 0 & HER2pos_prim == 1,ASCO := "HR-HER2+"]
+all[HRpos_prim == 0 & HER2pos_prim == 0,ASCO := "HR-HER2-"]
+
+dall = merge(all[TissueType == "primary tumor",],all[TissueType == "lymph node mts",c("PID","ASCO")],by = "PID",all.x = T)
+
+#Flowdiagram (mol_sign -> primary ASCO/CAP -> LN met)
+dall[,freq := .N, by = c("Mol_Signature","ASCO.x","ASCO.y")]
+dall[,Mol_Signature:= factor(Mol_Signature,levels = c("Luminal B (HER2-)","Luminal B (HER2+)","#NULL!","Triple negative","Luminal A","HER2"))]
+test = unique(dall[,c("Mol_Signature","ASCO.x","ASCO.y","freq")])
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/flow_pm.pdf")
+ggplot(test,aes(y = freq, axis1 = Mol_Signature , axis2 = ASCO.x, axis3 = ASCO.y)) +
+  geom_flow(stat = "alluvium", aes(fill = Mol_Signature)) +
+  scale_x_discrete(limits = c("Mol_Signature","ASCO.x","ASCO.y")) +
+  scale_fill_manual(values = cols_mol$col)+
+  geom_stratum(fill = c(rev(cols_mol$col[1:6]),c("grey20","grey70","grey50","grey90"),c("white","grey20","grey70","grey50","grey90")))+
+  geom_text(stat = "stratum", infer.label = TRUE)
+dev.off()
+
+
+
+#Only matched
+dall = merge(all[TissueType == "primary tumor",],all[TissueType == "lymph node mts",c("PID","ASCO")],by = "PID")
+dall[PID == "175",Mol_Signature := "HER2"]
+dall[PID == "1569",Mol_Signature := "HER2"]
+dall[PID == "552",Mol_Signature := "Luminal B (HER2+)"]
+dall[PID == "1590",Mol_Signature := "Luminal A"]
+dall = unique(dall)
+
+#Flowdiagram (mol_sign -> primary ASCO/CAP -> LN met)
+dall[,freq := .N, by = c("Mol_Signature","ASCO.x","ASCO.y")]
+dall[,Mol_Signature:= factor(Mol_Signature,levels = c("Luminal B (HER2-)","Luminal B (HER2+)","#NULL!","Triple negative","Luminal A","HER2"))]
+test = unique(dall[,c("Mol_Signature","ASCO.x","ASCO.y","freq")])
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/flow_pm.pdf")
+ggplot(test,aes(y = freq, axis1 = Mol_Signature , axis2 = ASCO.x, axis3 = ASCO.y)) +
+  geom_flow(stat = "alluvium", aes(fill = Mol_Signature)) +
+  scale_x_discrete(limits = c("Mol_Signature","ASCO.x","ASCO.y")) +
+  scale_fill_manual(values = cols_mol$col)+
+  geom_stratum(fill = c(rev(cols_mol$col[1:6]),c("grey20","grey70","grey50","grey90"),c("grey20","grey70","grey50","grey90")))+
+  geom_text(stat = "stratum", infer.label = TRUE)
+dev.off()
+
+#Withou clin subtype
+dall[,freq := .N, by = c("ASCO.x","ASCO.y")]
+test = unique(dall[,c("ASCO.x","ASCO.y","freq")])
+test$ASCO.x = factor(test$ASCO.x,levels = rev(c("HR-HER2-","HR+HER2-","HR+HER2+","HR-HER2+")))
+test$ASCO.y = factor(test$ASCO.y,levels = rev(c("HR-HER2-","HR+HER2-","HR+HER2+","HR-HER2+")))
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/HER2_push_flow.pdf")
+ggplot(test,aes(y = freq, axis2 = ASCO.x, axis3 = ASCO.y)) +
+  geom_flow(stat = "alluvium", aes(fill = ASCO.x)) +
+  scale_x_discrete(limits = c("ASCO.x","ASCO.y")) +
+  scale_fill_manual(values = rev(c("grey90","grey70","grey50","grey20")))+
+  geom_stratum(fill = c(c("grey90","grey70","grey50","grey20"),c("grey90","grey70","grey50","grey20")))+
+  geom_text(stat = "stratum", infer.label = TRUE)
+dev.off()
+
+
+#How many agree based on ASCO/CAP
+m = all[TissueType == "lymph node mts",c("PID","ASCO","HRpos_prim","HER2pos_prim")]
+colnames(m) = c("PID","ASCO_met","HRpos_met","HER2pos_met")
+dall = merge(all[TissueType == "primary tumor",],m,by = "PID")
+dall[duplicated(PID),]
+dall[duplicated(PID,fromLast = T),]
+dall[PID == "175",Mol_Signature := "HER2"]
+dall[PID == "1569",Mol_Signature := "HER2"]
+dall[PID == "552",Mol_Signature := "Luminal B (HER2+)"]
+dall[PID == "1590",Mol_Signature := "Luminal A"]
+dall = unique(dall)
+
+dall[HRpos_prim == HRpos_met, HR := "agree"]
+dall[HRpos_prim < HRpos_met, HR := "HR not in primary"]
+dall[HRpos_prim > HRpos_met, HR := "HR not in met"]
+dall[HER2pos_prim == HER2pos_met, HER2 := "agree"]
+dall[HER2pos_prim < HER2pos_met, HER2 := "HER2 not in primary"] 
+dall[HER2pos_prim > HER2pos_met, HER2 := "HER2 not in met"] 
+
+p = dall[,nHR := .N, by = c("HR")] 
+p = unique(p[,c("HR","nHR")])
+g1 = ggplot(p,aes(x = as.factor(1),y = nHR, fill = as.factor(HR)))+geom_bar(stat = "identity")+scale_fill_grey()+ theme(aspect.ratio = 2)+ 
+ggtitle("HR agree")
+
+p = dall[,nHER2 := .N, by = c("HER2")]
+ p = unique(p[,c("HER2","nHER2")])
+g2 = ggplot(p,aes(x = as.factor(1),y = nHER2, fill = as.factor(HER2)))+geom_bar(stat = "identity")+scale_fill_grey()+ 
+ theme(aspect.ratio = 2)+ 
+ggtitle("HER2 agree")
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/prop.pdf")
+g1 + g2
+dev.off()
+
+#Agreement betw. primary ASCO and clinical subtype
+dall$clinHR = "disagree"
+dall[HRpos_prim == 1 & str_detect(Mol_Signature,"Luminal"), clinHR := "agree"]
+dall[HRpos_prim == 0 & !str_detect(Mol_Signature,"Luminal"), clinHR := "agree"]
+dall[Mol_Signature == "#NULL!",clinHR := "agree"]
+dall[clinHR == "disagree" & HRpos_prim == HRpos_met,clinHR := "disagree BUT"]
+dall$clinHR = factor(dall$clinHR, levels = c("disagree","disagree BUT","agree"))
+
+dall$clinHER2 = "disagree"
+dall[HER2pos_prim == 1 & Mol_Signature %in% c("Luminal B (HER2+)","HER2"), clinHER2 := "agree"]
+dall[HER2pos_prim == 0 & !Mol_Signature %in% c("Luminal B (HER2+)","HER2"), clinHER2 := "agree"]
+dall[Mol_Signature == "#NULL!",clinHER2 := "agree"]
+dall[clinHER2 == "disagree"]
+dall[clinHER2 == "disagree" & HER2pos_prim == HER2pos_met,clinHER2 := "disagree BUT"]
+dall$clinHER2 = factor(dall$clinHER2, levels = c("disagree","disagree BUT","agree"))
+
+p = dall[,nHR := .N, by = c("clinHR")] 
+p = unique(p[,c("clinHR","nHR")])
+g1 = ggplot(p,aes(x = as.factor(1),y = nHR, fill = as.factor(clinHR)))+geom_bar(stat = "identity")+scale_fill_grey(start=0.8, end=0.2)+ theme(aspect.ratio = 2)+ 
+ggtitle("HR clin agree")
+
+p = dall[,nHER2 := .N, by = c("clinHER2")]
+ p = unique(p[,c("clinHER2","nHER2")])
+g2 = ggplot(p,aes(x = as.factor(1),y = nHER2, fill = as.factor(clinHER2)))+geom_bar(stat = "identity")+scale_fill_grey(start=0.8, end=0.2)+ 
+ theme(aspect.ratio = 2)+ 
+ggtitle("HER2 clin agree")
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/HER2_push_clin_bars.pdf")
+g1 + g2
+dev.off()
+
+```
+
+Force regular flowdiagram into same order.....
+```{r}
+#Get most abundant LN met cluster
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=20,] #met = met[test >=20,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Extract for each sample the cluster that makes up the largest proportion of cells
+m = apply(met[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(met[,-"PID"])[x]})
+
+#Exclude samples with shared largest proportion -> don't exclude just randomly sample!!!!
+# PID_excl = met$PID[unlist(lapply(n,length)) > 1]
+# n = n[!unlist(lapply(n,length)) > 1]
+
+n[unlist(lapply(n,length)) > 1] = lapply(n[unlist(lapply(n,length)) > 1],function(x){x[[1]][1]})
+
+#Put most abundant LN met cluster for each patient into a table
+maj_met = as.data.table(unlist(n))
+names(maj_met) = "cluster_met"
+maj_met$PID = met$PID #[!met$PID %in% PID_excl]
+
+
+#Get most abundant primary tumor cluster
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=20,] #primary = primary[test >=20,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('tumor_cluster_100','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+#Extract for each sample the cluster that makes up the largest proportion of cells
+m = apply(primary[,-"PID"],1,function(x){x == max(x)})
+n = apply(t(m),1,which)
+n = lapply(n,function(x){names(primary[,-"PID"])[x]})
+
+#Exclude samples with shared largest proportion -> nooo just randomly sample!
+# PID_excl = primary$PID[unlist(lapply(n,length)) > 1]
+# n = n[!unlist(lapply(n,length)) > 1]
+n[unlist(lapply(n,length)) > 1] = lapply(n[unlist(lapply(n,length)) > 1],function(x){x[[1]][1]})
+
+
+#Put most abundant primary tumor cluster for each patient into a table
+maj_prim = as.data.table(unlist(n))
+names(maj_prim) = "cluster_prim"
+maj_prim$PID = primary$PID #[!primary$PID %in% PID_excl]
+
+
+#Combine primary and LN met info and calculate shared patient fraction per most abundant cluster combination
+comb = merge(maj_prim,maj_met,by = "PID")
+add = unique(as.data.table(colData(subset(sce_t,,TissueType == "primary tumor"))[,c("PID","Mol_Signature")]))
+add[PID == "175",Mol_Signature := "HER2"]
+add[PID == "1569",Mol_Signature := "HER2"]
+add[PID == "552",Mol_Signature := "Luminal B (HER2+)"]
+add[PID == "1590",Mol_Signature := "Luminal A"]
+add[duplicated(PID),Mol_Signature := "#NULL!"]
+add[duplicated(PID,fromLast = T),Mol_Signature := "#NULL!"]
+add = unique(add)
+
+comb = merge(comb,add,by = "PID",all.x = T)
+
+#order according to dall from ggalluvial above
+comb = merge(comb,dall[,c("PID","ASCO.x")],by = "PID")
+comb = comb[order(ASCO.x,cluster_prim),]
+order_conceptually = rev(c("42","33","10","43","29","19","5","55","41","37","44","45","15","48","6","18","31","50","36","25","58","39","52","54","57","59","7","38","22","11","4","2","27","46","32","34","23","20","3","49","8","13","14","24","28","21","53","9","35","47","16","12","17","30","51","1","26"))
+order_conceptually = order_conceptually[order_conceptually %in% unique(c(unique(comb$cluster_prim),unique(comb$cluster_met)))]
+comb[,cluster_prim := factor(cluster_prim,levels = order_conceptually)]
+comb[,cluster_met := factor(cluster_met,levels = order_conceptually)]
+
+comb[,Freq := .N,by = c("cluster_prim","cluster_met")]
+comb = unique(comb[,c("cluster_prim","cluster_met","Freq")])
+
+prim_cols = tcols[cluster %in% levels(comb$cluster_prim)[levels(comb$cluster_prim) %in% unique(comb$cluster_prim)],]
+prim_cols = prim_cols[order(match(cluster,levels(comb$cluster_prim)[levels(comb$cluster_prim) %in% unique(comb$cluster_prim)])),]$tumor_cols
+met_cols = tcols[cluster %in% levels(comb$cluster_met)[levels(comb$cluster_met) %in% unique(comb$cluster_met)],]
+met_cols = met_cols[order(match(cluster,levels(comb$cluster_met)[levels(comb$cluster_met) %in% unique(comb$cluster_met)])),]$tumor_cols
+
+
+#Plot flow diagram
+g = ggplot(comb,aes(y = Freq,axis1 = cluster_prim , axis2 = cluster_met)) +
+  geom_flow(aes(fill = cluster_prim)) +
+  scale_x_discrete(limits = c("cluster_prim","cluster_met")) +
+  scale_fill_manual(values = prim_cols)+
+  geom_stratum(fill = c(rev(prim_cols),rev(met_cols)))+
+  geom_text(stat = "stratum", infer.label = TRUE)
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/flow2.pdf")
+g
+dev.off()
+
+```
+
+IF analysis triple-negative questions panCK = Cy3 and clin = Cy7
+```{r IF analysis, eval = F}
+dat1 = fread("/home/ubuntu/tmp/server_homes/janaf/Data/2021/IF_whole_slides/Tripleneg_question/Segmentation/panCK_clin_first5/measurements_first5.csv")
+dat2 = fread("/home/ubuntu/tmp/server_homes/janaf/Data/2021/IF_whole_slides/Tripleneg_question/Segmentation/panCK_clin_second3/measurements_second3.csv")
+dat3 = fread("/home/ubuntu/tmp/server_homes/janaf/Data/2021/IF_whole_slides/Tripleneg_question/Segmentation/panCK_clin_second_last1/measurements_secondlast1.tsv")
+dat4 = fread("/home/ubuntu/tmp/server_homes/janaf/Data/2021/IF_whole_slides/Tripleneg_question/Segmentation/panCK_clin_last1/measurements_last1.csv")
+
+#Combine
+dat = rbind(dat1,dat2,dat3,dat4)
+
+#Save out IF single-cll data
+fwrite(dat,"/mnt/ZTMA_21_25_26/IF_singlecell/TN_question/panCK_clin_singlecell.csv")
+
+```
+
+IF measure clinical triple-negative one as reference
+```{r IF analysis}
+#This one was TNBC based on FISH for HER2 but the IHC data says HER2 2+
+ref = fread("/home/ubuntu/tmp/server_homes/janaf/Data/2021/IF_whole_slides/Tripleneg_question/Segmentation/Quantifying_clinical_TN_p53_clin/measurements.csv")
+
+mean(ref[Name == "Tumor",]$`Cell: Cy7 mean`)
+mean(ref[Name == "Stroma",]$`Cell: Cy7 mean`)
+max(ref[Name == "Tumor",]$`Cell: Cy7 mean`)
+
+ggplot(ref, aes(x = log(`Cell: Cy7 mean`))) + geom_density()
+ggplot(ref[Name == "Tumor",], aes(x = log(`Cell: Cy7 mean`))) + geom_density()
+ggplot(ref[Name == "Stroma",], aes(x = log(`Cell: Cy7 mean`))) + geom_density()
+
+ref$log_Cy7 = log(ref$`Cell: Cy7 mean`)
+res <- densityMclust(ref$log_Cy7, 2)
+ref$GMM_C7 = res$classification
+
+ggplot(ref,aes(x=log_Cy7,fill = as.factor(GMM_C7)))+geom_density()
+
+mean(ref[Name == "Tumor",]$log_Cy7)
+mean(ref[Name == "Stroma",]$log_Cy7)
+max(ref[Name == "Tumor",]$log_Cy7)
+
+ref = ref[,-"ROI"]
+ref = ref[,-"GMM_C7"]
+ref = ref[,-"log_Cy7"]
+
+```
+
+```{r}
+dat_all = fread("/mnt/ZTMA_21_25_26/IF_singlecell/TN_question/panCK_clin_singlecell.csv")
+dat_all = dat_all[,-"Parent"]
+
+#Merge with triple-neg ref but use only for Cy7
+dat_all = rbind(dat_all,ref)
+
+ggplot(dat_all, aes(x = log(`Cell: Cy7 mean`))) + geom_density()
+ggplot(dat_all[Name == "Tumor",], aes(x = log(`Cell: Cy7 mean`))) + geom_density()
+
+dat_all$log_Cy7 = log(dat_all$`Cell: Cy7 mean`)
+res <- densityMclust(dat_all$log_Cy7, 2)
+dat_all$GMM_C7 = res$classification
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/GMM.pdf")
+ggplot(dat_all,aes(x=log_Cy7,fill = as.factor(GMM_C7)))+geom_density(alpha = 0.5)
+dev.off()
+nrow(dat_all[Image == "B038521_424_wrong_clin_p53_TN_N3.czi" & GMM_C7 == 1 & Name == "Tumor",])
+dat_all$ref = 0
+dat_all[Image == "B038521_424_wrong_clin_p53_TN_N3.czi", ref := 1]
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/ref.pdf")
+ggplot(dat_all,aes(x=log_Cy7,fill = as.factor(ref)))+geom_density(alpha = 0.5)
+dev.off()
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/Name.pdf")
+ggplot(dat_all[Name != "Necrosis",],aes(x=log_Cy7,fill = as.factor(Name)))+geom_density(alpha = 0.5)
+dev.off()
+
+#Check spatial distribution of TN in ref
+dat_all$GMM_C7 = factor(dat_all$GMM_C7,levels = c("2","1"))
+png("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/spatial_TN.png")
+ggplot(dat_all[Image == "B038521_424_wrong_clin_p53_TN_N3.czi" & Name == "Tumor",], aes(x = `Centroid X µm`,y =`Centroid Y µm`, color = GMM_C7))+geom_point(size = 0.1)+
+      scale_y_continuous(trans = "reverse")+
+        theme_minimal()+
+      theme(axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text.x= element_blank(), axis.text.y= element_blank(), axis.ticks = element_blank(),legend.position = "none")
+dev.off()
+
+#Control bar of ref
+bar = dat_all[Image == "B038521_424_wrong_clin_p53_TN_N3.czi" & Name == "Tumor",]
+bar[,ncells := .N,by = GMM_C7]
+bar[,frac := ncells/.N]
+bar = unique(bar[,c("Image","GMM_C7","frac")])
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/ref_bar.pdf")
+ggplot(bar, aes(x = Image,y = frac, fill = rev(as.factor(GMM_C7))))+geom_bar(stat = "identity")
+dev.off()
+
+#Remove ref again
+dat_all = dat_all[Image != "B038521_424_wrong_clin_p53_TN_N3.czi",]
+
+#Check background
+mean(dat_all[Name == "Stroma",]$`Cell: Cy3 mean`)
+mean(dat_all[Name == "Stroma",]$`Cell: Cy7 mean`)
+
+ggplot(dat_all, aes(x = log(`Cell: Cy3 mean`))) + geom_density()
+ggplot(dat_all, aes(x = log(`Cell: Cy7 mean`))) + geom_density()
+
+
+#Biaxial plots
+sub = as.data.table(ddply(dat,.(Image),function(x) x[sample(nrow(x),nrow(x)/10, replace = F),]))
+ggplot(sub,aes(x = `Cell: Cy3 mean`,y = `Cell: Cy7 mean`))+geom_point()
+
+#Plot density of points on scatter
+ggplot(sub, aes(x = log(`Cell: Cy3 mean`),y = log(`Cell: Cy7 mean`)))+
+  stat_bin2d(aes(color=..count..), bins=300, geom='point', size=1.4, fill=1)+
+  scale_color_viridis(trans = "log10", option='inferno')
+
+#Color by image
+shuffle = sample(nrow(sub),replace = F)
+sub = sub[shuffle,]
+ggplot(sub, aes(x = log(`Cell: Cy3 mean`),y = log(`Cell: Cy7 mean`),color = as.factor(Image)))+geom_point()
+
+#GMM on clinical markers, take in stromal cells also to have true negatives
+library(mclust)
+
+# dat_all$log_Cy7 = log(dat_all$`Cell: Cy7 mean`)
+# res <- densityMclust(dat_all$log_Cy7, 2)
+# dat_all$GMM_C7 = res$classification
+
+# #Manual alternative
+# dat_all[log_Cy7 <8,GMM_C7 := 1]
+
+# ggplot(dat_all,aes(x=log_Cy7,fill = as.factor(GMM_C7)))+geom_density()
+# ggplot(dat_all,aes(x=`Cell: Cy7 mean`,fill = as.factor(GMM_C7)))+geom_density()
+
+#Also need GMM for panCK otherwise it enriches with stromal cells
+dat_all$log_Cy3 = log(dat_all$`Cell: Cy3 mean`)
+res <- densityMclust(dat_all$log_Cy3, 2)
+dat_all$GMM_C3 = res$classification
+
+ggplot(dat_all,aes(x=log_Cy3,fill = as.factor(GMM_C3)))+geom_density()
+ggplot(dat_all,aes(x=`Cell: Cy3 mean`,fill = as.factor(GMM_C3)))+geom_density()
+
+nrow(dat_all[Name == "Tumor" & GMM_C7 == 1 & GMM_C3 == 2,])
+
+tumor = dat_all[Name == "Tumor",]
+tumor$TN = 0
+tumor[GMM_C7 == 1 & GMM_C3 == 2,TN := 1]
+
+#Plot density of points on scatter
+ggplot(tumor, aes(x = log(`Cell: Cy3 mean`),y = log(`Cell: Cy7 mean`)))+
+  stat_bin2d(aes(color=..count..), bins=300, geom='point', size=1.4, fill=1)+
+  scale_color_viridis(trans = "log10", option='inferno')
+
+#Color by image
+ggplot(tumor, aes(x = log(`Cell: Cy3 mean`),y = log(`Cell: Cy7 mean`),color = as.factor(GMM_C7)))+geom_point()
+
+TN = tumor[TN == 1,]
+ggplot(TN, aes(x = log(`Cell: Cy3 mean`),y = log(`Cell: Cy7 mean`),color = as.factor(Image)))+geom_point()
+
+#Nice names for png
+tumor$`Clinical marker` = "positive"
+tumor[TN == 1,`Clinical marker` := "negative"]
+tumor$`Clinical marker` = factor(tumor$`Clinical marker`,levels = c("positive","negative"))
+
+#Plot distribution of negative vs positive on image
+png("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/IF_TN1.png")
+for (i in unique(tumor$Image)){
+  print(ggplot(tumor[Image == eval(i),], aes(x = `Centroid X µm`,y =`Centroid Y µm`, color = `Clinical marker`))+geom_point(size = 0.1)+
+      scale_y_continuous(trans = "reverse")+
+        theme_minimal()+
+      theme(axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text.x= element_blank(), axis.text.y= element_blank(), axis.ticks = element_blank(),legend.position = "none"))
+    
+}
+dev.off()
+
+
+#Plot fraction triple-negative for each
+tumor[,count := .N,by = c("TN","Image")]
+tumor[,frac := count/ .N, by= "Image"]
+test = unique(tumor[,c("Image","TN","frac")])
+test = test[order(TN,frac),]
+test[,Image := factor(Image, levels = unique(test$Image))]
+g0 = ggplot(test, aes(x = Image, y = frac, fill = as.factor(TN)))+geom_bar(stat = "identity")+ theme(axis.text.x = element_text(angle = 90))
+
+o = c("713","402","99","761","569","488","126","171","969","1364")
+
+```
+
+Compare to our cores
+```{r}
+#Get most LN met cluster fractions
+met = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "lymph node mts"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "lymph node mts"))))
+met = met[sizeflag != 1,]
+met[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+met[,test := .N,by = "PID"]
+met = met[test >=20,]
+met[,frac_cluster := ncells/.N, by=c('PID')]
+met = unique(met[,c('tumor_cluster_100','frac_cluster','PID')])
+met = dcast.data.table(met, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+
+#Get most primary tumor cluster fractions
+primary = as.data.table(data.frame(colData(subset(sce_t,,TissueType == "primary tumor"))[c('PID','core','tumor_cluster_100','sizeflag')],id = colnames(subset(sce_t,,TissueType == "primary tumor"))))
+primary = primary[sizeflag != 1,]
+primary[,ncells:=.N ,by= c('PID', 'tumor_cluster_100')]
+primary[,test := .N,by = "PID"]
+primary = primary[test >=20,]
+primary[,frac_cluster := ncells/.N, by=c('PID')]
+primary = unique(primary[,c('tumor_cluster_100','frac_cluster','PID')])
+primary = dcast.data.table(primary, 'PID ~ tumor_cluster_100',value.var = 'frac_cluster',fill = 0)
+
+primary = primary[PID %in% o,]
+met = met[PID %in% o,]
+
+tcols = fread('/mnt/ZTMA_21_25_26/analysis/tcols.csv',header = T)
+primary = melt.data.table(primary,id.vars = "PID", variable.name = "cluster",value.name = "frac")
+primary[,PID := factor(PID, levels = o)]
+g1 = ggplot(primary, aes(x = PID, y = frac, fill = as.factor(cluster)))+geom_bar(stat = "identity")+ theme(axis.text.x = element_text(angle = 90)) + scale_fill_manual(values = tcols$tumor_cols)
+
+met = melt.data.table(met,id.vars = "PID", variable.name = "cluster",value.name = "frac")
+met[,PID := factor(PID, levels = o)]
+g2 = ggplot(met, aes(x = PID, y = frac, fill = as.factor(cluster)))+geom_bar(stat = "identity")+ theme(axis.text.x = element_text(angle = 90)) + scale_fill_manual(values = tcols[cluster %in% met$cluster,]$tumor_cols)
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/compareIMCIF.pdf")
+g2 / g1 / g0
+dev.off()
+
+```
+
+IF analysis CD11c question p53 = Cy3 and CD11c = Cy7
+```{r, eval = F}
+dat1 = fread("/home/ubuntu/tmp/server_homes/janaf/Data/2021/IF_whole_slides/CD11c_question/Segmentation/p53_CD11c_first4/measurements_first4.csv")
+dat2 = fread("/home/ubuntu/tmp/server_homes/janaf/Data/2021/IF_whole_slides/CD11c_question/Segmentation/p53_CD11c_second3/measurements_second3.csv")
+dat3 = fread("/home/ubuntu/tmp/server_homes/janaf/Data/2021/IF_whole_slides/CD11c_question/Segmentation/p53_CD11c_last3/measurements_last3.csv")
+
+#Combine
+dat = rbind(dat1,dat2,dat3)
+
+#Save out IF single-cll data
+fwrite(dat,"/mnt/ZTMA_21_25_26/IF_singlecell/CD11c_question/CD11c_p53_singlecell.csv")
+
+```
+
+Quantify number of p53 and CD11c positive cells
+```{r}
+dat = fread("/mnt/ZTMA_21_25_26/IF_singlecell/CD11c_question/CD11c_p53_singlecell.csv")
+
+dat$log_Cy7 = log(dat$`Cell: Cy7 mean`)
+dat$log_Cy3 = log(dat$`Cell: Cy3 mean`)
+res <- densityMclust(dat$log_Cy7, 2)
+dat$GMM_C7 = res$classification
+
+ggplot(dat,aes(x=log_Cy7,fill = as.factor(GMM_C7)))+geom_density()
+ggplot(dat,aes(x=log_Cy7,fill = as.factor(Name)))+geom_density()
+
+
+#GMM for p53
+res <- densityMclust(dat$log_Cy3, 2)
+dat$GMM_C3 = res$classification
+
+ggplot(dat,aes(x=log_Cy3,fill = as.factor(GMM_C3)))+geom_density()
+ggplot(dat,aes(x=log_Cy3,fill = as.factor(Name)))+geom_density()
+
+dat$CT = "rest"
+dat[GMM_C7 == 2 & Name == "Stroma",CT := "CD11c+"]
+dat[GMM_C3 == 2 & Name == "Tumor",CT := "p53+"]
+
+
+#Plot distribution of cell types on image
+for (i in unique(dat$Image)){
+  print(ggplot(dat[Image == eval(i),], aes(x = `Centroid X µm`,y =`Centroid Y µm`, color = as.factor(CT)))+geom_point(size = 0.1)+
+      scale_y_continuous(trans = "reverse") + ggtitle(eval(i)))
+}
+
+
+#Quantify numbers pos or neg
+dat[,ncells := .N, by = c("CT","Name","Image")]
+dat[,frac := ncells/.N,by = c("Name","Image")]
+
+#sub = dat[(CT == "p53+" & Name == "Tumor") | (CT == "CD11c+" & Name == "Stroma"),]
+sub = unique(dat[,c("Image","CT","Name","frac")])
+
+library(stringr)
+sub[str_detect(Image, "pos"),type :="CD11c+Node-"]
+sub[str_detect(Image, "neg"),type :="CD11c-Node+"]
+sub = sub[order(type),]
+sub$Image = factor(sub$Image,levels = unique(sub$Image))
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/p53_CD11c.pdf")
+ggplot(sub, aes(x = Name, y = frac, fill = CT))+geom_bar(stat = "identity")+
+  facet_wrap(.~Image)
+dev.off()
+
+pdf("/home/ubuntu/tmp/server_homes/janaf/Data/2020/ZTMA21_25_26/R_dat/boxplots.pdf")
+ggplot(sub, aes(x = type, y = frac, color = CT))+geom_boxplot()
+dev.off()
+
+#Correlation
+c = sub[CT != "rest",]
+c = dcast.data.table(c, "Image + type ~ CT", value.var = "frac")
+
+c = rbind(c, data.table(Image = "B038935_420_redone_neg.czi",type = "CD11c-Node+",(c[Image == "B038935_420_redone_neg.czi - Scene #0",c("CD11c+","p53+")] + c[Image == "B038935_420_redone_neg.czi - Scene #1",c("CD11c+","p53+")])/2))
+c = rbind(c, data.table(Image = "B987625_1433_neg.czi",type = "CD11c-Node+",(c[Image == "B987625_1433_neg.czi - Scene #0",c("CD11c+","p53+")] + c[Image == "B987625_1433_neg.czi - Scene #1",c("CD11c+","p53+")])/2))
+c = c[!str_detect(Image, "Scene"),]
+
+pos = c[type == "CD11c+Node-",]
+pos = pos[Image != "B9522308_1771_redone_pos.czi",]
+neg = c[type == "CD11c-Node+",]
+cor(pos[,c("CD11c+","p53+")])
+cor(neg[,c("CD11c+","p53+")])
+```
